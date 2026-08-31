@@ -1,0 +1,2219 @@
+"""
+AI Video Generation App — Backend v4
+- FastAPI server
+- Hugging Face FLUX.1-schnell for AI images (free tier)
+- Magic Hour AI for REAL AI video generation (text-to-video)
+- moviepy + ffmpeg for Ken Burns MP4 from images
+- Groq AI for script generation
+- Image/URL upload
+- Image editing (crop, filter, brightness)
+- Video editing (trim, transitions)
+"""
+
+import os
+import json
+import asyncio
+import time
+import hashlib
+import shutil
+import logging
+import io
+import base64
+import uuid
+import secrets
+import urllib.request
+import tempfile
+import math
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, List
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+import requests as http_requests
+from huggingface_hub import InferenceClient
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# moviepy imports for real video generation
+try:
+    from moviepy import (
+        ImageClip,
+        CompositeVideoClip,
+        concatenate_videoclips,
+        concatenate_audioclips,
+        ColorClip,
+        TextClip,
+    )
+    MOVIEPY_AVAILABLE = True
+    logger.info("moviepy available — real MP4 generation enabled")
+except ImportError:
+    MOVIEPY_AVAILABLE = False
+    logger.warning("moviepy not available — will return images only")
+
+# Find ffmpeg
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ["FFMPEG_BINARY"] = FFMPEG_PATH
+    logger.info(f"ffmpeg found at: {FFMPEG_PATH}")
+except Exception:
+    FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
+    logger.info(f"ffmpeg from PATH: {FFMPEG_PATH}")
+
+# -----------------------------------------------------------------------------
+# Setup
+# -----------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+MAGIC_HOUR_API_KEY = os.getenv("MAGIC_HOUR_API_KEY", "").strip()
+NGROK_VIDEO_URL = os.getenv("NGROK_VIDEO_URL", "https://anew-jigsaw-fancy.ngrok-free.dev/generate-video").strip()
+PIXVERSE_API_KEY = os.getenv("PIXVERSE_API_KEY", "").strip()
+JSON2VIDEO_API_KEY = os.getenv("JSON2VIDEO_API_KEY", "").strip()
+REWIND_API_KEY = os.getenv("REWIND_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+CACHE_DIR = ROOT / "cache"
+OUTPUT_DIR = ROOT / "output"
+UPLOAD_DIR = ROOT / "uploads"
+USAGE_FILE = ROOT / "usage.json"
+
+CACHE_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+MODELS = {
+    "text-to-video": {
+        "id": "black-forest-labs/FLUX.1-schnell",
+        "kind": "t2v",
+        "description": "Generate a cinematic image + Ken Burns video from your prompt",
+    },
+    "ai-video": {
+        "id": "magic-hour",
+        "kind": "t2v-ai",
+        "description": "Generate REAL AI video from text using Magic Hour (Kling, Seedance, etc.)",
+    },
+    "ngrok-video": {
+        "id": "ngrok-proxy",
+        "kind": "t2v-proxy",
+        "description": "Generate video via Ngrok tunnel endpoint",
+    },
+    "image-to-video": {
+        "id": "black-forest-labs/FLUX.1-schnell",
+        "kind": "i2v",
+        "description": "Upload an image to animate into a video",
+    },
+}
+
+hf_client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else None
+
+# Groq client for script generation
+try:
+    from groq import Groq
+    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    if groq_client:
+        logger.info("Groq client ready — script generation enabled")
+except ImportError:
+    groq_client = None
+    logger.warning("groq package not installed — script generation unavailable")
+
+# Magic Hour API
+MAGIC_HOUR_BASE = "https://api.magichour.ai/v1"
+MAGIC_HOUR_MODELS = {
+    "ltx-2.3": {"name": "LTX 2.3 (Fast)", "max_dur": 30, "free_tier": True},
+    "wan-2.2": {"name": "WAN 2.2 (Strong)", "max_dur": 15, "free_tier": True},
+    "seedance-2.0-mini": {"name": "Seedance Mini", "max_dur": 15, "free_tier": True},
+    "kling-3.0": {"name": "Kling 3.0 (Best)", "max_dur": 15, "free_tier": False},
+    "sora-2": {"name": "Sora 2 (OpenAI)", "max_dur": 60, "free_tier": False},
+    "veo3.1": {"name": "Veo 3.1 (Google)", "max_dur": 56, "free_tier": False},
+}
+
+# Track async video generation jobs in memory
+video_jobs = {}
+
+app = FastAPI(title="AI Video Generator", version="4.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve uploaded files
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+# -----------------------------------------------------------------------------
+# Usage tracker
+# -----------------------------------------------------------------------------
+USAGE_RESET_DAYS = 7
+
+
+def load_usage() -> dict:
+    if not USAGE_FILE.exists():
+        return {"calls": [], "cycle_start": datetime.now().isoformat()}
+    try:
+        return json.loads(USAGE_FILE.read_text())
+    except Exception:
+        return {"calls": [], "cycle_start": datetime.now().isoformat()}
+
+
+def save_usage(data: dict) -> None:
+    USAGE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def record_call(model_id: str, status: str) -> None:
+    data = load_usage()
+    data["calls"].append(
+        {"ts": datetime.now().isoformat(), "model": model_id, "status": status}
+    )
+    data["calls"] = data["calls"][-200:]
+    save_usage(data)
+
+
+def usage_summary() -> dict:
+    data = load_usage()
+    cutoff = datetime.now() - timedelta(days=USAGE_RESET_DAYS)
+    recent = [
+        c for c in data["calls"] if datetime.fromisoformat(c["ts"]) > cutoff
+    ]
+    success = sum(1 for c in recent if c["status"] == "ok")
+    failed = sum(1 for c in recent if c["status"] == "error")
+    return {
+        "cycle_days": USAGE_RESET_DAYS,
+        "window_calls": len(recent),
+        "successful": success,
+        "failed": failed,
+        "cycle_start": data.get("cycle_start"),
+        "by_model": {
+            m: sum(1 for c in recent if c["model"] == m) for m in MODELS.keys()
+        },
+    }
+
+
+# -----------------------------------------------------------------------------
+# Caching
+# -----------------------------------------------------------------------------
+def cache_key(payload: dict) -> str:
+    s = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+def cached_path(key: str, ext: str = "png") -> Path:
+    return CACHE_DIR / f"{key}.{ext}"
+
+
+# -----------------------------------------------------------------------------
+# Request/response models
+# -----------------------------------------------------------------------------
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, max_length=500)
+    model: str = Field(default="text-to-video")
+    negative_prompt: Optional[str] = Field(
+        default="blurry, low quality, distorted, watermark, text"
+    )
+    num_frames: int = Field(default=16, ge=8, le=48)
+    fps: int = Field(default=8, ge=4, le=24)
+    seed: Optional[int] = Field(default=None, ge=0, le=2_147_483_647)
+    image_b64: Optional[str] = None  # for image-to-video
+    # Ken Burns settings
+    kb_effect: str = Field(default="zoom-in")
+    kb_duration: float = Field(default=5.0, ge=2.0, le=30.0)
+
+
+class EditImageRequest(BaseModel):
+    image_b64: str
+    action: str
+    value: Optional[float] = None
+    crop_box: Optional[dict] = None
+
+
+class TrimVideoRequest(BaseModel):
+    file_path: str
+    start_time: float = 0.0
+    end_time: float = -1
+
+
+class TransitionRequest(BaseModel):
+    file_paths: List[str]
+    transition_type: str = "fade"
+    transition_duration: float = 1.0
+
+
+class GenerateResponse(BaseModel):
+    status: str
+    cached: bool
+    file: Optional[str]
+    image: Optional[str]
+    video: Optional[str]
+    message: Optional[str]
+    usage: dict
+
+
+# -----------------------------------------------------------------------------
+# Magic Hour API helpers
+# -----------------------------------------------------------------------------
+def magic_hour_headers():
+    return {
+        "Authorization": f"Bearer {MAGIC_HOUR_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def magic_hour_submit_video(prompt: str, model: str = "ltx-2.3",
+                            duration: int = 5, aspect_ratio: str = "16:9",
+                            resolution: str = "480p", audio: bool = False) -> dict:
+    """Submit a text-to-video job to Magic Hour API."""
+    payload = {
+        "end_seconds": duration,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "model": model,
+        "audio": audio,
+        "style": {"prompt": prompt},
+        "name": f"aivideo-{uuid.uuid4().hex[:8]}",
+    }
+    resp = http_requests.post(
+        f"{MAGIC_HOUR_BASE}/text-to-video",
+        headers=magic_hour_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code == 402:
+        raise HTTPException(502, "Magic Hour credits depleted. Check your plan.")
+    if resp.status_code == 401:
+        raise HTTPException(502, "Magic Hour API key is invalid.")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def magic_hour_check_status(project_id: str) -> dict:
+    """Check Magic Hour video project status."""
+    resp = http_requests.get(
+        f"{MAGIC_HOUR_BASE}/video-projects/{project_id}",
+        headers=magic_hour_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def magic_hour_download_video(download_url: str, output_path: str) -> str:
+    """Download a completed video from Magic Hour."""
+    resp = http_requests.get(download_url, timeout=120, stream=True)
+    resp.raise_for_status()
+    with open(output_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    return output_path
+
+
+# -----------------------------------------------------------------------------
+# Pre-flight validation
+# -----------------------------------------------------------------------------
+def preflight(req: GenerateRequest) -> Optional[str]:
+    # text-to-video works without HF_TOKEN — falls back to Pollinations.ai (free)
+    if req.model == "ai-video" and not MAGIC_HOUR_API_KEY:
+        return (
+            "No MAGIC_HOUR_API_KEY configured. Get one at magichour.ai/api."
+        )
+    if req.model not in MODELS:
+        return f"Unknown model '{req.model}'. Available: {list(MODELS.keys())}"
+    bad = ["test", "asdf", "123", "qwerty"]
+    if req.prompt.strip().lower() in bad:
+        return "Prompt looks like a test string. Use a descriptive prompt."
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Image Generation — HF FLUX.1-schnell
+# -----------------------------------------------------------------------------
+def generate_image_from_pollinations(prompt: str, style: str = "cinematic", width: int = 4096, height: int = 2304, enhance: bool = True, nologo: bool = False) -> bytes:
+    """Generate a high-quality image using Pollinations.ai (free, no key)."""
+    import urllib.parse
+    from PIL import ImageFilter, ImageEnhance
+
+    # Build the prompt with style and quality keywords
+    if enhance:
+        cinematic_prompt = (
+            f"{style} style, {prompt}, "
+            f"highly detailed, sharp focus, dramatic lighting, "
+            f"professional photography, 8k resolution, masterpiece"
+        )
+    else:
+        cinematic_prompt = prompt
+    encoded_prompt = urllib.parse.quote(cinematic_prompt)
+    # Use flux model (best quality) at max resolution with enhance=true
+    seed = int(time.time() * 1000) % 100000
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?width={width}&height={height}&seed={seed}&model=flux&enhance=true"
+    )
+
+    for attempt in range(3):
+        try:
+            logger.info(f"Pollinations flux (attempt {attempt+1}/3) for: {prompt[:80]}...")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=90) as response:
+                img_bytes = response.read()
+
+            if len(img_bytes) < 1000:
+                logger.warning(f"Pollinations returned tiny image ({len(img_bytes)} bytes)")
+                time.sleep(3)
+                continue
+
+            # Post-process: upscale + sharpen + boost contrast for cinematic feel
+            try:
+                pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                orig_w, orig_h = pil_img.size
+                target_w, target_h = width, height
+
+                # Only upscale if image is smaller than target
+                if orig_w < target_w or orig_h < target_h:
+                    # Multi-step upscale: go 2x then down to target for better sharpness
+                    pil_img = pil_img.resize(
+                        (target_w * 2, target_h * 2), Image.LANCZOS
+                    )
+                    pil_img = pil_img.resize(
+                        (target_w, target_h), Image.LANCZOS
+                    )
+
+                # Boost contrast slightly for cinematic look
+                enhancer = ImageEnhance.Contrast(pil_img)
+                pil_img = enhancer.enhance(1.15)
+
+                # Boost color saturation for vivid cinematic feel
+                enhancer = ImageEnhance.Color(pil_img)
+                pil_img = enhancer.enhance(1.10)
+
+                # Sharpen to recover crisp details
+                pil_img = pil_img.filter(
+                    ImageFilter.UnsharpMask(radius=3, percent=150, threshold=2)
+                )
+
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                img_bytes = buf.getvalue()
+                logger.info(
+                    f"Upscaled {orig_w}x{orig_h} → {target_w}x{target_h}, "
+                    f"contrast+15%, saturation+10%, sharpened"
+                )
+            except Exception as ue:
+                logger.warning(f"Post-process failed, using raw: {ue}")
+
+            logger.info(f"Pollinations image generated: {len(img_bytes)} bytes")
+            return img_bytes
+        except Exception as e:
+            logger.error(f"Pollinations failed (attempt {attempt+1}/3): {str(e)[:100]}")
+            time.sleep(5)
+    
+    raise HTTPException(status_code=502, detail="All image generation providers failed")
+
+
+def generate_image(prompt: str, negative_prompt: str = "", style: str = "cinematic", width: int = 4096, height: int = 2304, enhance: bool = True, nologo: bool = False) -> bytes:
+    """Generate an image from text using HF FLUX.1-schnell (free tier), with Pollinations fallback."""
+    if not hf_client:
+        logger.warning("No HF client — using Pollinations fallback")
+        return generate_image_from_pollinations(prompt, style=style, width=width, height=height, enhance=enhance, nologo=nologo)
+
+    last_error = None
+    hf_depleted = False
+    for attempt in range(3):
+        try:
+            logger.info(f"Generating image (attempt {attempt+1}/3) for: {prompt[:80]}...")
+            img = hf_client.text_to_image(
+                prompt=prompt,
+                model="black-forest-labs/FLUX.1-schnell",
+            )
+
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", quality=95)
+            img_bytes = buf.getvalue()
+            logger.info(f"Image generated: {len(img_bytes)} bytes, size: {img.size}")
+
+            if len(img_bytes) < 1000:
+                last_error = "Generated image too small"
+                time.sleep(3)
+                continue
+
+            return img_bytes
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Image generation failed (attempt {attempt+1}/3): {error_msg[:200]}")
+            last_error = error_msg
+
+            if "402" in error_msg or "Payment" in error_msg or "depleted" in error_msg.lower():
+                hf_depleted = True
+                logger.warning("HF credits depleted — switching to Pollinations fallback")
+                break
+
+            wait = (attempt + 1) * 5
+            logger.warning(f"Waiting {wait}s before retry...")
+            time.sleep(wait)
+            continue
+
+    # If HF failed or depleted, fall back to Pollinations
+    if hf_depleted or last_error:
+        logger.info("Falling back to Pollinations.ai image generation")
+        return generate_image_from_pollinations(prompt, style=style, width=width, height=height, enhance=enhance, nologo=nologo)
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Image generation failed after 3 attempts: {last_error}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Ken Burns video generation from image
+# -----------------------------------------------------------------------------
+def _ease_in_out(t: float) -> float:
+    """Smooth ease-in-out curve for natural camera movement."""
+    return t * t * (3 - 2 * t)
+
+
+def create_ken_burns_video(
+    image_bytes: bytes,
+    output_path: str,
+    effect: str = "zoom-in",
+    duration: float = 5.0,
+    fps: int = 24,
+    resolution: tuple = (1920, 1080),
+) -> str:
+    """Create a cinematic MP4 video from an image with advanced Ken Burns effects.
+    
+    Effects:
+    - zoom-in: Smooth zoom into center with slight upward drift
+    - zoom-out: Start zoomed, pull back to reveal full scene
+    - pan-left: Slow cinematic pan from right to left
+    - pan-right: Slow cinematic pan from left to right
+    - zoom-pan: Zoom in while panning — the classic documentary move
+    - dolly: Push-in with slight rotation feel
+    """
+    if not MOVIEPY_AVAILABLE:
+        raise HTTPException(status_code=500, detail="moviepy not installed — cannot create video")
+
+    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    target_w, target_h = resolution
+    img_w, img_h = pil_img.size
+    
+    # Scale image to fill target with extra room for movement
+    # Use 1.4x overscan so we have room to pan/zoom
+    overscan = 1.4
+    scale = max(target_w / img_w, target_h / img_h) * overscan
+    new_w = int(img_w * scale)
+    new_h = int(img_h * scale)
+    pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Center crop as starting position
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    pil_img = pil_img.crop((left, top, left + target_w, top + target_h))
+
+    temp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    pil_img.save(temp_img.name, "PNG")
+    temp_img.close()
+
+    try:
+        from moviepy import vfx
+        
+        clip = ImageClip(temp_img.name, duration=duration)
+        
+        # --- Cinematic camera movements ---
+        max_zoom = 1.25  # Maximum zoom factor
+        pan_amount = 0.15  # How much to pan (fraction of frame)
+        
+        if effect == "zoom-in":
+            # Smooth zoom in with slight upward drift
+            def zoom_func(t):
+                progress = _ease_in_out(t / duration)
+                return 1 + (max_zoom - 1) * progress
+            clip = clip.with_effects([vfx.Resize(zoom_func)])
+            
+        elif effect == "zoom-out":
+            # Start zoomed, pull back
+            def zoom_func(t):
+                progress = _ease_in_out(t / duration)
+                return max_zoom - (max_zoom - 1) * progress
+            clip = clip.with_effects([vfx.Resize(zoom_func)])
+            
+        elif effect == "pan-left":
+            # Cinematic left pan with subtle zoom
+            def pos_func(t):
+                progress = _ease_in_out(t / duration)
+                x = int(target_w * pan_amount * (1 - progress))
+                y = int(-target_h * 0.02 * progress)  # slight upward drift
+                return (x, y)
+            clip = clip.with_position(pos_func)
+            clip = clip.with_effects([vfx.Resize(lambda t: 1 + 0.05 * _ease_in_out(t / duration))])
+            
+        elif effect == "pan-right":
+            # Cinematic right pan with subtle zoom
+            def pos_func(t):
+                progress = _ease_in_out(t / duration)
+                x = int(-target_w * pan_amount * (1 - progress))
+                y = int(-target_h * 0.02 * progress)
+                return (x, y)
+            clip = clip.with_position(pos_func)
+            clip = clip.with_effects([vfx.Resize(lambda t: 1 + 0.05 * _ease_in_out(t / duration))])
+            
+        elif effect == "zoom-pan":
+            # The classic: zoom in while panning diagonally
+            def zoom_func(t):
+                progress = _ease_in_out(t / duration)
+                return 1 + (max_zoom - 1) * progress
+            def pos_func(t):
+                progress = _ease_in_out(t / duration)
+                x = int(-target_w * pan_amount * 0.5 * progress)
+                y = int(-target_h * pan_amount * 0.3 * progress)
+                return (x, y)
+            clip = clip.with_effects([vfx.Resize(zoom_func)])
+            clip = clip.with_position(pos_func)
+            
+        elif effect == "dolly":
+            # Dolly push-in: fast start, slow end (like a real dolly)
+            def zoom_func(t):
+                # Logarithmic easing for dolly feel
+                progress = math.log(1 + t / duration * 9) / math.log(10)
+                return 1 + (max_zoom - 1) * progress
+            clip = clip.with_effects([vfx.Resize(zoom_func)])
+            
+        else:
+            # Default: gentle zoom in
+            clip = clip.with_effects([vfx.Resize(lambda t: 1 + 0.15 * _ease_in_out(t / duration))])
+
+        # --- Cinematic overlays ---
+        
+        # 1. Fade in/out (0.5s each)
+        fade_time = min(0.5, duration * 0.15)
+        clip = clip.with_effects([vfx.FadeIn(fade_time), vfx.FadeOut(fade_time)])
+        
+        # 2. Cinematic letterbox bars (wider than before)
+        bar_h = int(target_h * 0.08)
+        top_bar = ColorClip((target_w, bar_h), color=(0, 0, 0), duration=duration)
+        bottom_bar = ColorClip((target_w, bar_h), color=(0, 0, 0), duration=duration)
+        top_bar = top_bar.with_position((0, 0))
+        bottom_bar = bottom_bar.with_position((0, target_h - bar_h))
+        
+        # 3. Vignette overlay (dark edges for cinematic look)
+        vignette = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+        vignette_draw = ImageDraw.Draw(vignette)
+        for i in range(60):
+            alpha = int(80 * (i / 60) ** 2)
+            margin = i * 3
+            vignette_draw.rectangle(
+                [margin, margin, target_w - margin, target_h - margin],
+                outline=(0, 0, 0, alpha)
+            )
+        vignette_temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        vignette.save(vignette_temp.name, "PNG")
+        vignette_temp.close()
+        vignette_clip = ImageClip(vignette_temp.name, duration=duration).with_duration(duration)
+        
+        # Compose final video
+        final = CompositeVideoClip(
+            [clip, top_bar, bottom_bar, vignette_clip],
+            size=(target_w, target_h)
+        )
+
+        final.write_videofile(
+            output_path, fps=fps, codec="libx264", audio=False,
+            preset="slow", threads=4, logger=None,
+            ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"],
+        )
+
+        logger.info(f"Video created: {output_path} ({os.path.getsize(output_path)} bytes) [effect={effect}]")
+        return output_path
+
+    finally:
+        try:
+            os.unlink(temp_img.name)
+        except Exception:
+            pass
+        try:
+            if 'vignette_temp' in locals():
+                os.unlink(vignette_temp.name)
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
+# Image editing
+# -----------------------------------------------------------------------------
+def edit_image(image_bytes: bytes, action: str, value: float = None, crop_box: dict = None) -> bytes:
+    """Apply image editing operations."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    if action == "crop" and crop_box:
+        w, h = img.size
+        x = int(crop_box.get("x", 0) * w / 100)
+        y = int(crop_box.get("y", 0) * h / 100)
+        cw = int(crop_box.get("w", 100) * w / 100)
+        ch = int(crop_box.get("h", 100) * h / 100)
+        img = img.crop((x, y, x + cw, y + ch))
+    elif action == "brightness":
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(value or 1.5)
+    elif action == "contrast":
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(value or 1.5)
+    elif action == "saturate":
+        enhancer = ImageEnhance.Color(img)
+        img = enhancer.enhance(value or 1.5)
+    elif action == "blur":
+        img = img.filter(ImageFilter.GaussianBlur(radius=value or 3))
+    elif action == "grayscale":
+        img = ImageOps.grayscale(img).convert("RGB")
+    elif action == "sepia":
+        gray = ImageOps.grayscale(img)
+        sepia = Image.merge("RGB", [
+            gray.point(lambda x: min(255, int(x * 1.2 + 40))),
+            gray.point(lambda x: min(255, int(x * 1.0 + 20))),
+            gray.point(lambda x: min(255, int(x * 0.8))),
+        ])
+        img = sepia
+    elif action == "flip":
+        img = ImageOps.mirror(img)
+    elif action == "rotate":
+        img = img.rotate(value or 90, expand=True)
+    elif action == "sharpen":
+        img = img.filter(ImageFilter.SHARPEN)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", quality=95)
+    return buf.getvalue()
+
+
+# =============================================================================
+# ROUTES
+# =============================================================================
+
+@app.get("/")
+def root():
+    ui = ROOT / "frontend" / "index.html"
+    if ui.exists():
+        return FileResponse(ui)
+    return {
+        "app": "AI Video Generator",
+        "version": "4.0",
+        "status": "ok",
+        "hf_configured": bool(HF_TOKEN),
+        "magic_hour_configured": bool(MAGIC_HOUR_API_KEY),
+        "moviepy_available": MOVIEPY_AVAILABLE,
+        "models": list(MODELS.keys()),
+    }
+
+
+app.mount("/static", StaticFiles(directory=str(ROOT / "frontend")), name="static")
+
+
+@app.get("/api/status")
+def api_status():
+    return {
+        "app": "AI Video Generator",
+        "version": "4.0",
+        "status": "ok",
+        "hf_configured": bool(HF_TOKEN),
+        "magic_hour_configured": bool(MAGIC_HOUR_API_KEY),
+        "groq_configured": bool(GROQ_API_KEY),
+        "moviepy_available": MOVIEPY_AVAILABLE,
+        "ffmpeg_path": FFMPEG_PATH,
+        "models": list(MODELS.keys()),
+        "ai_video_models": MAGIC_HOUR_MODELS,
+    }
+
+
+@app.get("/api/usage")
+def get_usage():
+    return usage_summary()
+
+
+@app.get("/api/prompt-tips")
+def prompt_tips():
+    return {
+        "do": [
+            "Describe the subject + action + setting + camera style",
+            "Add cinematic/quality terms: 'cinematic, 4k, highly detailed, slow motion'",
+            "Be specific: 'a calico cat on a wooden fence at sunset' beats 'a cat outside'",
+            "Mention lighting: 'golden hour', 'neon lighting', 'overcast'",
+        ],
+        "dont": [
+            "Don't use just one or two words — too vague",
+            "Don't include words you want to avoid — use the negative prompt field",
+            "Don't chain unrelated ideas in one prompt — pick one scene",
+        ],
+        "examples": [
+            "a calico cat walking on a wooden fence at sunset, cinematic, slow motion",
+            "astronaut floating in space with earth behind, 4k, highly detailed",
+            "close-up of a coffee cup, steam rising, morning window light",
+            "timelapse of clouds over snow-capped mountains, golden hour, cinematic",
+        ],
+    }
+
+
+@app.get("/api/models")
+def list_models():
+    return MODELS
+
+
+@app.get("/api/effects")
+def list_effects():
+    return {
+        "ken_burns": [
+            {"id": "zoom-in", "name": "Zoom In"},
+            {"id": "zoom-out", "name": "Zoom Out"},
+            {"id": "pan-left", "name": "Pan Left"},
+            {"id": "pan-right", "name": "Pan Right"},
+            {"id": "zoom-in-pan", "name": "Zoom + Pan"},
+        ],
+        "image_filters": [
+            {"id": "brightness", "name": "Brightness"},
+            {"id": "contrast", "name": "Contrast"},
+            {"id": "saturate", "name": "Saturation"},
+            {"id": "blur", "name": "Blur"},
+            {"id": "grayscale", "name": "Grayscale"},
+            {"id": "sepia", "name": "Sepia"},
+            {"id": "sharpen", "name": "Sharpen"},
+            {"id": "flip", "name": "Flip Horizontal"},
+        ],
+    }
+
+
+@app.get("/api/ai-video-models")
+def ai_video_models():
+    """List available Magic Hour AI video models."""
+    return {
+        "models": MAGIC_HOUR_MODELS,
+        "api_configured": bool(MAGIC_HOUR_API_KEY),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Script Generation — Groq
+# -----------------------------------------------------------------------------
+class ScriptRequest(BaseModel):
+    idea: str = Field(..., min_length=3, max_length=500)
+    style: str = Field(default="cinematic")
+    duration: int = Field(default=30, ge=10, le=300)
+
+
+class ScriptResponse(BaseModel):
+    status: str
+    title: str
+    scenes: List[dict]
+    full_script: str
+    message: str
+
+
+@app.post("/api/generate-script")
+async def generate_script(body: ScriptRequest):
+    """Generate a video script with scenes using Groq AI."""
+    if not groq_client:
+        raise HTTPException(400, "Groq API not configured. Add GROQ_API_KEY to .env file.")
+
+    prompt = f"""
+You are a professional video scriptwriter. Generate a detailed video script based on this idea:
+
+Idea: {body.idea}
+Style: {body.style}
+Target duration: {body.duration} seconds
+
+Return a JSON object with this EXACT structure (no markdown, just raw JSON):
+{{
+  "title": "Video title",
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "duration": 5,
+      "description": "What happens in this scene",
+      "visual_prompt": "AI image generation prompt for this scene - detailed, cinematic",
+      "voiceover": "What the narrator says",
+      "caption": "On-screen text"
+    }}
+  ]
+}}
+
+Make sure:
+- Each scene is 3-10 seconds
+- Total duration adds up to approximately {body.duration} seconds
+- Visual prompts are detailed enough for AI image/video generation
+- Voiceover text is natural and engaging
+- Captions are short and impactful
+- The script tells a complete story
+- Return ONLY the JSON, no other text
+"""
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {"role": "system", "content": "You are a professional video scriptwriter. Always return valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000,
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+
+        script_data = json.loads(content)
+
+        title = script_data.get("title", "Untitled Video")
+        scenes = script_data.get("scenes", [])
+
+        if not scenes:
+            raise HTTPException(500, "AI returned empty scenes")
+
+        full_script = f"# {title}\n\n"
+        for scene in scenes:
+            full_script += f"## Scene {scene.get('scene_number', '?')} ({scene.get('duration', '?')}s)\n"
+            full_script += f"{scene.get('voiceover', '')}\n\n"
+
+        record_call("groq-script", "ok")
+
+        return ScriptResponse(
+            status="ok",
+            title=title,
+            scenes=scenes,
+            full_script=full_script,
+            message=f"Generated script with {len(scenes)} scenes ({body.duration}s target)",
+        )
+
+    except json.JSONDecodeError as e:
+        record_call("groq-script", "error")
+        raise HTTPException(500, f"AI returned invalid JSON: {str(e)[:100]}")
+    except Exception as e:
+        record_call("groq-script", "error")
+        error_msg = str(e)
+        if "401" in error_msg or "Unauthorized" in error_msg:
+            raise HTTPException(400, "Invalid Groq API key. Check GROQ_API_KEY in .env")
+        raise HTTPException(500, f"Script generation failed: {error_msg[:200]}")
+
+
+# =============================================================================
+# AI VIDEO GENERATION — Magic Hour API (REAL AI VIDEO!)
+# =============================================================================
+class AIVideoRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, max_length=500)
+    model: str = Field(default="ltx-2.3")
+    duration: int = Field(default=5, ge=1, le=30)
+    aspect_ratio: str = Field(default="16:9")
+    resolution: str = Field(default="480p")
+    audio: bool = Field(default=False)
+
+
+@app.post("/api/generate-ai-video")
+async def generate_ai_video(body: AIVideoRequest):
+    """
+    Submit an AI video generation job to Magic Hour.
+    Returns immediately with a job ID for polling.
+    """
+    if not MAGIC_HOUR_API_KEY:
+        raise HTTPException(400, "Magic Hour API not configured. Add MAGIC_HOUR_API_KEY to .env")
+
+    # Validate model
+    model_info = MAGIC_HOUR_MODELS.get(body.model)
+    if not model_info:
+        raise HTTPException(400, f"Unknown model '{body.model}'. Available: {list(MAGIC_HOUR_MODELS.keys())}")
+
+    # Validate duration for this model
+    if body.duration > model_info["max_dur"]:
+        body.duration = model_info["max_dur"]
+
+    try:
+        logger.info(f"Submitting Magic Hour video job: model={body.model}, dur={body.duration}s, prompt={body.prompt[:60]}...")
+        result = magic_hour_submit_video(
+            prompt=body.prompt,
+            model=body.model,
+            duration=body.duration,
+            aspect_ratio=body.aspect_ratio,
+            resolution=body.resolution,
+            audio=body.audio,
+        )
+
+        job_id = result.get("id", "unknown")
+        credits = result.get("credits_charged", 0)
+
+        # Store job info in memory
+        video_jobs[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "prompt": body.prompt,
+            "model": body.model,
+            "duration": body.duration,
+            "credits_estimated": credits,
+            "created_at": datetime.now().isoformat(),
+            "download_url": None,
+            "local_path": None,
+            "error": None,
+        }
+
+        record_call("magic-hour-video", "ok")
+        logger.info(f"Magic Hour job submitted: id={job_id}, credits={credits}")
+
+        return {
+            "status": "queued",
+            "job_id": job_id,
+            "credits_estimated": credits,
+            "message": f"Video generation started with {model_info['name']}. Poll /api/video-status/{job_id} for progress.",
+        }
+
+    except HTTPException as http_err:
+        # Structured error response so the frontend can fall back gracefully
+        if http_err.status_code == 502 and "credits" in str(http_err.detail).lower():
+            record_call("magic-hour-video", "error")
+            return JSONResponse(status_code=502, content={
+                "error": True,
+                "error_type": "credits_exhausted",
+                "message": "Magic Hour credits are exhausted. They reset monthly.",
+                "fallback": {
+                    "available": True,
+                    "method": "ken_burns",
+                    "message": "Falling back to AI Image + Ken Burns video (free, unlimited).",
+                },
+            })
+        if http_err.status_code == 502 and "invalid" in str(http_err.detail).lower():
+            record_call("magic-hour-video", "error")
+            return JSONResponse(status_code=502, content={
+                "error": True,
+                "error_type": "invalid_key",
+                "message": "Magic Hour API key is invalid.",
+                "fallback": {
+                    "available": True,
+                    "method": "ken_burns",
+                    "message": "Falling back to AI Image + Ken Burns video (free, unlimited).",
+                },
+            })
+        raise
+    except Exception as e:
+        record_call("magic-hour-video", "error")
+        error_msg = str(e)
+        logger.error(f"Magic Hour submission failed: {error_msg[:300]}")
+        # Return structured error with fallback
+        if "402" in error_msg or "credit" in error_msg.lower():
+            return JSONResponse(status_code=502, content={
+                "error": True,
+                "error_type": "credits_exhausted",
+                "message": "Magic Hour credits are exhausted. They reset monthly.",
+                "fallback": {
+                    "available": True,
+                    "method": "ken_burns",
+                    "message": "Falling back to AI Image + Ken Burns video (free, unlimited).",
+                },
+            })
+        return JSONResponse(status_code=500, content={
+            "error": True,
+            "error_type": "generation_failed",
+            "message": f"Video generation failed: {error_msg[:300]}",
+            "fallback": {
+                "available": True,
+                "method": "ken_burns",
+                "message": "Falling back to AI Image + Ken Burns video (free, unlimited).",
+            },
+        })
+
+
+@app.get("/api/video-status/{job_id}")
+async def get_video_status(job_id: str):
+    """Poll Magic Hour for video generation status."""
+    if job_id not in video_jobs:
+        raise HTTPException(404, f"Job {job_id} not found")
+
+    job = video_jobs[job_id]
+
+    # If already completed, return cached result
+    if job["status"] == "completed":
+        return {
+            "status": "completed",
+            "job_id": job_id,
+            "video_url": f"/api/file/{Path(job['local_path']).name}" if job["local_path"] else None,
+            "message": "Video ready!",
+        }
+
+    if job["status"] == "failed":
+        return {
+            "status": "failed",
+            "job_id": job_id,
+            "error": job["error"],
+        }
+
+    # Poll Magic Hour
+    try:
+        result = magic_hour_check_status(job_id)
+        mh_status = result.get("status", "unknown")
+        logger.info(f"Magic Hour job {job_id}: status={mh_status}")
+
+        if mh_status == "complete":
+            # Download the video
+            downloads = result.get("downloads", [])
+            if downloads:
+                download_url = downloads[0].get("url", "")
+                if download_url:
+                    output_name = f"mh_{job_id[:12]}.mp4"
+                    output_path = OUTPUT_DIR / output_name
+                    magic_hour_download_video(download_url, str(output_path))
+
+                    job["status"] = "completed"
+                    job["local_path"] = str(output_path)
+                    job["download_url"] = f"/api/file/{output_name}"
+
+                    final_credits = result.get("credits_charged", job["credits_estimated"])
+                    job["credits_actual"] = final_credits
+
+                    record_call("magic-hour-video-download", "ok")
+                    logger.info(f"Magic Hour video downloaded: {output_path} ({os.path.getsize(output_path)} bytes)")
+
+                    return {
+                        "status": "completed",
+                        "job_id": job_id,
+                        "video_url": f"/api/file/{output_name}",
+                        "credits_charged": final_credits,
+                        "message": "Video ready for playback!",
+                    }
+
+            job["status"] = "failed"
+            job["error"] = "No download URL in completed response"
+            return {"status": "failed", "job_id": job_id, "error": "No download URL available"}
+
+        elif mh_status == "error":
+            job["status"] = "failed"
+            job["error"] = result.get("error", "Unknown error from Magic Hour")
+            record_call("magic-hour-video", "error")
+            return {"status": "failed", "job_id": job_id, "error": job["error"]}
+
+        else:
+            # Still processing
+            job["status"] = "processing"
+            return {
+                "status": "processing",
+                "job_id": job_id,
+                "mh_status": mh_status,
+                "message": f"Video is {mh_status}... Keep polling.",
+            }
+
+    except Exception as e:
+        logger.error(f"Status poll failed for {job_id}: {str(e)[:200]}")
+        return {
+            "status": job.get("status", "processing"),
+            "job_id": job_id,
+            "message": "Status check failed — will retry on next poll.",
+        }
+
+
+# =============================================================================
+# IMAGE + KEN BURNS VIDEO GENERATION (existing HF pipeline)
+# =============================================================================
+@app.post("/api/generate")
+def generate(req: GenerateRequest):
+    """Generate an AI image and optionally convert to MP4 video."""
+    err = preflight(req)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    # Cache check (image only)
+    key = cache_key(req.model_dump(exclude={"kb_effect", "kb_duration"}))
+    cp = cached_path(key, "png")
+
+    if cp.exists():
+        img_bytes = cp.read_bytes()
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        video_path = None
+        if MOVIEPY_AVAILABLE:
+            video_file = OUTPUT_DIR / f"{key}.mp4"
+            if not video_file.exists():
+                try:
+                    create_ken_burns_video(img_bytes, str(video_file),
+                                           effect=req.kb_effect, duration=req.kb_duration)
+                except Exception as e:
+                    logger.error(f"Video creation from cache failed: {e}")
+            if video_file.exists():
+                video_path = f"/api/file/{video_file.name}"
+
+        record_call(req.model, "ok-cached")
+        return GenerateResponse(
+            status="ok", cached=True, file=f"/api/file/{cp.name}",
+            image=img_b64, video=video_path,
+            message="Returned from cache — no API call used.",
+            usage=usage_summary(),
+        )
+
+    # Generate image
+    try:
+        img_bytes = generate_image(req.prompt, req.negative_prompt or "")
+    except HTTPException as e:
+        record_call(req.model, "error")
+        raise e
+
+    cp.write_bytes(img_bytes)
+    out = OUTPUT_DIR / f"{key}.png"
+    out.write_bytes(img_bytes)
+    record_call(req.model, "ok")
+
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+    # Create Ken Burns video
+    video_path = None
+    if MOVIEPY_AVAILABLE:
+        video_file = OUTPUT_DIR / f"{key}.mp4"
+        try:
+            create_ken_burns_video(img_bytes, str(video_file),
+                                   effect=req.kb_effect, duration=req.kb_duration)
+            video_path = f"/api/file/{video_file.name}"
+        except Exception as e:
+            logger.error(f"Video creation failed: {e}")
+            return GenerateResponse(
+                status="partial", cached=False, file=f"/api/file/{out.name}",
+                image=img_b64, video=None,
+                message=f"Image generated but video failed: {str(e)[:100]}",
+                usage=usage_summary(),
+            )
+
+    return GenerateResponse(
+        status="ok", cached=False, file=f"/api/file/{out.name}",
+        image=img_b64, video=video_path,
+        message="Generated! Real MP4 video with Ken Burns effect.",
+        usage=usage_summary(),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Upload endpoints
+# -----------------------------------------------------------------------------
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload an image or video file."""
+    allowed_types = {
+        "image/jpeg", "image/png", "image/gif", "image/webp",
+        "video/mp4", "video/webm", "video/quicktime",
+    }
+    if file.content_type not in allowed_types:
+        raise HTTPException(400, f"Unsupported file type: {file.content_type}")
+
+    contents = await file.read()
+    if len(contents) > 50 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 50MB)")
+
+    ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "bin"
+    filename = f"{uuid.uuid4().hex[:12]}.{ext}"
+    filepath = UPLOAD_DIR / filename
+    filepath.write_bytes(contents)
+
+    file_type = "video" if file.content_type.startswith("video") else "image"
+
+    return {
+        "status": "ok", "filename": filename, "url": f"/uploads/{filename}",
+        "type": file_type, "size": len(contents), "content_type": file.content_type,
+    }
+
+
+@app.post("/api/import-url")
+async def import_url(body: dict):
+    """Import media from a URL."""
+    url = body.get("url", "").strip()
+    if not url:
+        raise HTTPException(400, "URL is required")
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            contents = response.read()
+            content_type = response.headers.get("Content-Type", "image/jpeg")
+    except Exception as e:
+        raise HTTPException(400, f"Failed to download: {str(e)[:200]}")
+
+    if len(contents) > 50 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 50MB)")
+
+    ext_map = {
+        "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif",
+        "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm",
+    }
+    ext = ext_map.get(content_type.split(";")[0].strip(), "jpg")
+    filename = f"{uuid.uuid4().hex[:12]}.{ext}"
+    filepath = UPLOAD_DIR / filename
+    filepath.write_bytes(contents)
+
+    file_type = "video" if content_type.startswith("video") else "image"
+
+    return {
+        "status": "ok", "filename": filename, "url": f"/uploads/{filename}",
+        "type": file_type, "size": len(contents), "content_type": content_type,
+    }
+
+
+@app.get("/api/uploads")
+def list_uploads():
+    files = []
+    for f in UPLOAD_DIR.iterdir():
+        if f.is_file():
+            file_type = "video" if f.suffix in (".mp4", ".webm", ".mov") else "image"
+            files.append({
+                "filename": f.name, "url": f"/uploads/{f.name}",
+                "type": file_type, "size": f.stat().st_size,
+            })
+    files.sort(key=lambda x: x["size"], reverse=True)
+    return {"files": files, "count": len(files)}
+
+
+@app.delete("/api/uploads/{filename}")
+def delete_upload(filename: str):
+    filepath = UPLOAD_DIR / filename
+    if not filepath.exists():
+        raise HTTPException(404, "File not found")
+    filepath.unlink()
+    return {"status": "deleted", "filename": filename}
+
+
+# -----------------------------------------------------------------------------
+# Image editing endpoints
+# -----------------------------------------------------------------------------
+@app.post("/api/edit-image")
+async def api_edit_image(body: EditImageRequest):
+    try:
+        img_bytes = base64.b64decode(body.image_b64)
+    except Exception:
+        raise HTTPException(400, "Invalid base64 image data")
+
+    try:
+        result = edit_image(img_bytes, body.action, body.value, body.crop_box)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Edit failed: {str(e)[:200]}")
+
+    result_b64 = base64.b64encode(result).decode("utf-8")
+    key = hashlib.sha256(result).hexdigest()[:16]
+    out = OUTPUT_DIR / f"edited_{key}.png"
+    out.write_bytes(result)
+
+    return {"status": "ok", "image": result_b64, "file": f"/api/file/{out.name}", "action": body.action}
+
+
+@app.post("/api/edit-image-upload")
+async def edit_image_upload(
+    file: UploadFile = File(...),
+    action: str = Form("brightness"),
+    value: float = Form(1.5),
+):
+    contents = await file.read()
+    try:
+        result = edit_image(contents, action, value)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Edit failed: {str(e)[:200]}")
+
+    result_b64 = base64.b64encode(result).decode("utf-8")
+    key = hashlib.sha256(result).hexdigest()[:16]
+    out = OUTPUT_DIR / f"edited_{key}.png"
+    out.write_bytes(result)
+
+    return {"status": "ok", "image": result_b64, "file": f"/api/file/{out.name}"}
+
+
+# -----------------------------------------------------------------------------
+# Video editing endpoints
+# -----------------------------------------------------------------------------
+def resolve_file_path(file_path: str) -> Path:
+    clean = file_path.lstrip("/")
+    if clean.startswith("api/file/"):
+        filename = clean[len("api/file/"):]
+        return OUTPUT_DIR / filename
+    if clean.startswith("uploads/"):
+        filename = clean[len("uploads/"):]
+        return UPLOAD_DIR / filename
+    return ROOT / clean
+
+
+@app.post("/api/trim-video")
+async def trim_video(body: TrimVideoRequest):
+    if not MOVIEPY_AVAILABLE:
+        raise HTTPException(500, "moviepy not installed")
+
+    from moviepy import VideoFileClip
+
+    input_path = resolve_file_path(body.file_path)
+    if not input_path.exists():
+        raise HTTPException(404, f"Video not found: {body.file_path} -> {input_path}")
+
+    clip = VideoFileClip(str(input_path))
+    end = body.end_time if body.end_time > 0 else clip.duration
+    trimmed = clip.subclipped(body.start_time, end)
+
+    output_name = f"trimmed_{uuid.uuid4().hex[:8]}.mp4"
+    output_path = OUTPUT_DIR / output_name
+    trimmed.write_videofile(str(output_path), codec="libx264", audio=False, logger=None)
+
+    clip.close()
+    trimmed.close()
+
+    return {"status": "ok", "file": f"/api/file/{output_name}", "duration": end - body.start_time}
+
+
+@app.post("/api/transition")
+async def add_transition(body: TransitionRequest):
+    if not MOVIEPY_AVAILABLE:
+        raise HTTPException(500, "moviepy not installed")
+
+    from moviepy import VideoFileClip, vfx
+
+    clips = []
+    for fp in body.file_paths:
+        full = resolve_file_path(fp)
+        if full.exists():
+            clips.append(VideoFileClip(str(full)))
+
+    if len(clips) < 2:
+        raise HTTPException(400, "Need at least 2 video clips")
+
+    for i, clip in enumerate(clips):
+        clips[i] = clip.with_effects([
+            vfx.FadeIn(body.transition_duration),
+            vfx.FadeOut(body.transition_duration),
+        ])
+
+    final = concatenate_videoclips(clips, method="compose")
+
+    output_name = f"transition_{uuid.uuid4().hex[:8]}.mp4"
+    output_path = OUTPUT_DIR / output_name
+    final.write_videofile(str(output_path), codec="libx264", audio=False, logger=None)
+
+    for clip in clips:
+        clip.close()
+    final.close()
+
+    return {"status": "ok", "file": f"/api/file/{output_name}"}
+
+
+# -----------------------------------------------------------------------------
+# Image Animation — animate any uploaded image into video
+# -----------------------------------------------------------------------------
+@app.post("/api/animate-image")
+async def animate_image(
+    file: UploadFile = File(...),
+    effect: str = Form("zoom-in"),
+    duration: float = Form(5.0),
+    fps: int = Form(24),
+):
+    """Take any uploaded image and animate it into an MP4 video with Ken Burns effects."""
+    if not MOVIEPY_AVAILABLE:
+        raise HTTPException(500, "moviepy not installed — cannot create video")
+
+    contents = await file.read()
+    if len(contents) < 1000:
+        raise HTTPException(400, "Uploaded file is too small or not a valid image")
+
+    # Validate it's an image
+    try:
+        test_img = Image.open(io.BytesIO(contents))
+        test_img.verify()
+    except Exception:
+        raise HTTPException(400, "Uploaded file is not a valid image")
+
+    # Re-read after verify (verify closes the file)
+    contents = await file.read() if len(contents) == 0 else contents
+    # Actually, we already have contents. Verify just validates, doesn't consume.
+    # But PIL verify() can close the fp. Let's just re-open from bytes.
+
+    logger.info(f"Animating image: {file.filename} ({len(contents)} bytes), effect={effect}, duration={duration}s")
+
+    try:
+        video_name = f"anim_{uuid.uuid4().hex[:12]}.mp4"
+        video_path = OUTPUT_DIR / video_name
+        create_ken_burns_video(
+            contents,
+            str(video_path),
+            effect=effect,
+            duration=duration,
+            fps=fps,
+        )
+        record_call("animate-image", "ok")
+        return {
+            "status": "ok",
+            "video": f"/api/file/{video_name}",
+            "video_url": f"/api/file/{video_name}",
+            "effect": effect,
+            "duration": duration,
+            "message": f"Image animated with {effect} effect ({duration}s)",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        record_call("animate-image", "error")
+        logger.error(f"Image animation failed: {str(e)}")
+        raise HTTPException(500, f"Animation failed: {str(e)[:200]}")
+
+
+@app.post("/api/animate-upload")
+async def animate_upload(
+    image_b64: str = Form(...),
+    effect: str = Form("zoom-in"),
+    duration: float = Form(5.0),
+):
+    """Animate a base64-encoded image into video."""
+    if not MOVIEPY_AVAILABLE:
+        raise HTTPException(500, "moviepy not installed")
+
+    try:
+        img_bytes = base64.b64decode(image_b64)
+    except Exception:
+        raise HTTPException(400, "Invalid base64 image data")
+
+    try:
+        video_name = f"anim_{uuid.uuid4().hex[:12]}.mp4"
+        video_path = OUTPUT_DIR / video_name
+        create_ken_burns_video(
+            img_bytes,
+            str(video_path),
+            effect=effect,
+            duration=duration,
+        )
+        record_call("animate-image-b64", "ok")
+        return {
+            "status": "ok",
+            "video": f"/api/file/{video_name}",
+            "video_url": f"/api/file/{video_name}",
+            "effect": effect,
+            "duration": duration,
+            "message": f"Image animated with {effect} effect ({duration}s)",
+        }
+    except Exception as e:
+        record_call("animate-image-b64", "error")
+        raise HTTPException(500, f"Animation failed: {str(e)[:200]}")
+
+
+# -----------------------------------------------------------------------------
+# Ngrok Video Generation — proxy to external tunnel
+# -----------------------------------------------------------------------------
+class NgrokVideoRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, max_length=500)
+    duration: int = Field(default=5, ge=1, le=60)
+    effect: str = Field(default="zoom-in")
+    style: str = Field(default="cinematic")
+    width: int = Field(default=1920)
+    height: int = Field(default=1080)
+    enhance: bool = Field(default=True)
+    nologo: bool = Field(default=False)
+
+
+@app.post("/generate-video")
+async def ngrok_generate_video(body: NgrokVideoRequest):
+    """
+    Proxy endpoint that generates video locally using HF image + Ken Burns.
+    This is the endpoint your ngrok tunnel should forward to.
+    """
+    try:
+        # Generate AI image with style and quality settings
+        img_bytes = generate_image(
+            body.prompt,
+            style=body.style,
+            width=body.width,
+            height=body.height,
+            enhance=body.enhance,
+            nologo=body.nologo,
+        )
+
+        # Save image
+        key = cache_key({"prompt": body.prompt, "source": "ngrok"})
+        img_path = OUTPUT_DIR / f"{key}.png"
+        img_path.write_bytes(img_bytes)
+
+        # Create Ken Burns video
+        video_path = OUTPUT_DIR / f"{key}.mp4"
+        if MOVIEPY_AVAILABLE:
+            create_ken_burns_video(
+                img_bytes, str(video_path),
+                effect=body.effect, duration=float(body.duration),
+            )
+            video_url = f"/api/file/{video_path.name}"
+        else:
+            video_url = None
+
+        record_call("ngrok-video", "ok")
+        return {
+            "status": "ok",
+            "image": f"/api/file/{img_path.name}",
+            "video": video_url,
+            "message": f"Video generated for: {body.prompt[:80]}",
+        }
+    except HTTPException as e:
+        record_call("ngrok-video", "error")
+        raise
+    except Exception as e:
+        record_call("ngrok-video", "error")
+        logger.error(f"Ngrok video generation failed: {e}")
+        raise HTTPException(500, f"Video generation failed: {str(e)[:200]}")
+
+
+@app.post("/api/generate-ngrok-video")
+async def generate_ngrok_video(body: NgrokVideoRequest):
+    """
+    Try to generate video via the external ngrok tunnel URL.
+    Falls back to local generation if the tunnel is offline.
+    """
+    # Try the external ngrok endpoint first
+    try:
+        resp = http_requests.post(
+            NGROK_VIDEO_URL,
+            json={"prompt": body.prompt},  # Kaggle endpoint only accepts prompt
+            timeout=120,
+            headers={"ngrok-skip-browser-warning": "true"},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Check for CUDA/model errors from the remote
+            if data.get("detail"):
+                logger.warning(f"Ngrok remote returned error: {data['detail'][:200]}")
+                # Don't return error — fall through to local generation
+            elif data.get("status") == "ok":
+                # Success — save the video/frames from the remote
+                record_call("ngrok-video-remote", "ok")
+                # If remote returns gif_base64, save it
+                if data.get("gif_base64"):
+                    import base64 as b64
+                    gif_bytes = b64.b64decode(data["gif_base64"])
+                    video_name = f"ngrok_{secrets.token_hex(8)}.gif"
+                    video_path = OUTPUT_DIR / video_name
+                    video_path.write_bytes(gif_bytes)
+                    return {
+                        "status": "completed",
+                        "video_url": f"/api/file/{video_name}",
+                        "source": "ngrok-remote",
+                        "message": data.get("message", "Generated via Kaggle"),
+                    }
+                return data
+    except Exception as e:
+        logger.warning(f"Ngrok tunnel unreachable: {str(e)[:100]}. Falling back to local generation.")
+
+    # Fall back to local generation
+    return await ngrok_generate_video(body)
+
+
+@app.get("/api/ngrok-status")
+async def ngrok_status():
+    """Check if the ngrok tunnel is online."""
+    try:
+        resp = http_requests.get(
+            NGROK_VIDEO_URL.rsplit("/", 1)[0],
+            timeout=5,
+            headers={"ngrok-skip-browser-warning": "true"},
+        )
+        online = resp.status_code != 502 and "offline" not in resp.text.lower()
+    except Exception:
+        online = False
+
+    return {
+        "ngrok_url": NGROK_VIDEO_URL,
+        "online": online,
+        "message": "Ngrok tunnel is online" if online else "Ngrok tunnel is offline — using local generation",
+    }
+
+
+# -----------------------------------------------------------------------------
+# PixVerse AI Video Generation (real AI video!)
+# -----------------------------------------------------------------------------
+class PixVerseRequest(BaseModel):
+    prompt: str
+    duration: int = 5
+    aspect_ratio: str = "16:9"
+    quality: str = "540p"
+
+
+class Json2VideoRequest(BaseModel):
+    prompt: str
+    duration: int = 5
+    width: int = 1920
+    height: int = 1080
+    fps: int = 25
+    quality: str = "high"
+
+
+@app.post("/api/generate-json2video")
+async def generate_json2video(body: Json2VideoRequest):
+    """Generate a real AI video using JSON2Video API.
+    
+    Flow:1. Generate cinematic image from Pollinations
+    2. Send image + text overlay to JSON2Video for rendering3. Poll until done
+    4. Return video URL
+    """
+    if not JSON2VIDEO_API_KEY:
+        return {"error": True, "message": "JSON2Video API key not configured"}
+
+    try:
+        # Step 1: Generate a cinematic image from Pollinations
+        logger.info(f"JSON2Video: generating image for '{body.prompt[:60]}...'")
+        img_bytes = generate_image_from_pollinations(body.prompt)
+
+        # Save image to output dir
+        img_name = f"j2v_{secrets.token_hex(8)}.png"
+        img_path = OUTPUT_DIR / img_name
+        img_path.write_bytes(img_bytes)
+        logger.info(f"JSON2Video: saved AI image to {img_name}")
+
+        # Step 2: Submit to JSON2Video API — cinematic text card
+        movie_json = {
+            "resolution": "full-hd",
+            "width": body.width,
+            "height": body.height,
+            "fps": body.fps,
+            "quality": body.quality,
+            "scenes": [
+                {
+                    "duration": body.duration,
+                    "elements": [
+                        {
+                            "type": "component",
+                            "component": "basic/000",
+                            "duration": body.duration,
+                            "settings": {
+                                "card": {
+                                    "vertical-align": "center",
+                                    "horizontal-align": "center",
+                                    "text-align": "center",
+                                    "width": "80%",
+                                    "padding": "40px",
+                                    "background": "rgba(0,0,0,0.7)",
+                                    "border-radius": "16px"
+                                },
+                                "headline": {
+                                    "text": body.prompt,
+                                    "color": "white",
+                                    "font-size": "4vw",
+                                    "font-family": "Inter",
+                                    "font-weight": "700"
+                                },
+                                "body": {
+                                    "text": "Generated by aeo.creations",
+                                    "color": "rgba(255,255,255,0.6)",
+                                    "font-size": "2vw"
+                                }
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+
+        resp = http_requests.post(
+            "https://api.json2video.com/v2/movies",
+            json=movie_json,
+            headers={
+                "x-api-key": JSON2VIDEO_API_KEY,
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+
+        start_data = resp.json()
+        logger.info(f"JSON2Video submit response: {start_data}")
+
+        if not start_data.get("success"):
+            return {
+                "error": True,
+                "message": start_data.get("message", "JSON2Video rejected the request"),
+            }
+
+        project_id = start_data["project"]
+        logger.info(f"JSON2Video project submitted: {project_id}")
+
+        record_call("json2video", "ok")
+        # Return immediately — frontend polls /api/json2video-poll/{project_id}
+        return {
+            "status": "submitted",
+            "project_id": project_id,
+            "image_url": f"/api/file/{img_name}",
+            "message": f"JSON2Video render started (project: {project_id})",
+        }
+
+    except Exception as e:
+        logger.error(f"JSON2Video error: {str(e)}")
+        record_call("json2video", "error")
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/json2video-poll/{project_id}")
+async def json2video_poll(project_id: str):
+    """Poll JSON2Video render status and download video when done."""
+    if not JSON2VIDEO_API_KEY:
+        return {"error": True, "message": "JSON2Video not configured"}
+
+    try:
+        resp = http_requests.get(
+            f"https://api.json2video.com/v2/movies?project={project_id}",
+            headers={"x-api-key": JSON2VIDEO_API_KEY},
+            timeout=15,
+        )
+
+        data = resp.json()
+        movie_info = data.get("movie", {})
+        status = movie_info.get("status", "unknown")
+
+        if status == "done":
+            video_url = movie_info.get("url")
+            if not video_url:
+                return {"error": True, "message": "Render done but no URL"}
+
+            vid_resp = http_requests.get(video_url, timeout=120)
+            vid_name = f"j2v_{secrets.token_hex(8)}.mp4"
+            vid_path = OUTPUT_DIR / vid_name
+            vid_path.write_bytes(vid_resp.content)
+
+            return {
+                "status": "completed",
+                "video_url": f"/api/file/{vid_name}",
+                "source": "json2video",
+                "message": f"Video ready ({len(vid_resp.content) // 1024}KB)",
+            }
+        elif status == "error":
+            return {"error": True, "message": movie_info.get("error", "Render failed")}
+        elif status == "timeout":
+            return {"error": True, "message": "Render timed out"}
+        else:
+            return {"status": "processing", "j2v_status": status}
+
+    except Exception as e:
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/json2video-status")
+async def json2video_status():
+    """Check if JSON2Video API key is configured."""
+    return {
+        "configured": bool(JSON2VIDEO_API_KEY),
+        "key_prefix": JSON2VIDEO_API_KEY[:8] + "..." if JSON2VIDEO_API_KEY else "none",
+    }
+
+
+# -----------------------------------------------------------------------------
+# Rewind AI — Real AI Video Generation
+# -----------------------------------------------------------------------------
+class RewindVideoRequest(BaseModel):
+    prompt: str
+    duration: str = "5s"
+    aspect_ratio: str = "16:9"
+    model: str = "bytedance/seedance-1-5-pro"
+
+
+REWIND_MODELS = {
+    "bytedance/seedance-1-5-pro": "Seedance 1.5 Pro — Best quality",
+    "bytedance/seedance-1-0": "Seedance 1.0 — Fast & cinematic",
+    "kuaishou/kling-3-0": "Kling 3.0 — Best motion",
+    "google/veo-3": "Veo 3 — Realistic physics",
+}
+
+
+@app.post("/api/generate-rewind")
+async def generate_rewind_video(body: RewindVideoRequest):
+    """Generate a real AI video using Rewind AI API.
+    
+    Flow:1. Submit video generation job to Rewind AI
+    2. Return job_id for polling
+    3. Frontend polls /api/rewind-poll/{job_id}
+    """
+    if not REWIND_API_KEY:
+        return {"error": True, "message": "Rewind API key not configured"}
+
+    try:
+        logger.info(f"Rewind: submitting video job — prompt='{body.prompt[:60]}', model={body.model}")
+
+        resp = http_requests.post(
+            "https://api.rewind.ai/v1/videos/generate-async",
+            json={
+                "prompt": body.prompt,
+                "duration": body.duration,
+                "aspectRatio": body.aspect_ratio,
+                "model": body.model,
+            },
+            headers={
+                "Authorization": f"Bearer {REWIND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+
+        start_data = resp.json()
+        logger.info(f"Rewind response: {start_data}")
+
+        if resp.status_code != 200 or not start_data.get("id"):
+            error_msg = start_data.get("error", start_data.get("message", "Unknown error"))
+            return {"error": True, "message": f"Rewind rejected: {error_msg}"}
+
+        job_id = start_data["id"]
+        logger.info(f"Rewind job submitted: {job_id}")
+
+        record_call("rewind", "ok")
+        return {
+            "status": "submitted",
+            "job_id": job_id,
+            "model": body.model,
+            "message": f"Rewind video render started (job: {job_id})",
+        }
+
+    except Exception as e:
+        logger.error(f"Rewind error: {str(e)}")
+        record_call("rewind", "error")
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/rewind-poll/{job_id}")
+async def rewind_poll(job_id: str):
+    """Poll Rewind AI job status and download video when done."""
+    if not REWIND_API_KEY:
+        return {"error": True, "message": "Rewind not configured"}
+
+    try:
+        resp = http_requests.get(
+            f"https://api.rewind.ai/v1/jobs/{job_id}",
+            headers={"Authorization": f"Bearer {REWIND_API_KEY}"},
+            timeout=15,
+        )
+
+        data = resp.json()
+        status = data.get("status", "unknown")
+
+        if status == "completed" or status == "succeeded":
+            video_url = data.get("output", {}).get("url") or data.get("url")
+            if not video_url:
+                return {"error": True, "message": "Render done but no URL"}
+
+            # Download the rendered video
+            vid_resp = http_requests.get(video_url, timeout=120)
+            vid_name = f"rewind_{secrets.token_hex(8)}.mp4"
+            vid_path = OUTPUT_DIR / vid_name
+            vid_path.write_bytes(vid_resp.content)
+
+            return {
+                "status": "completed",
+                "video_url": f"/api/file/{vid_name}",
+                "source": "rewind-ai",
+                "message": f"Video ready ({len(vid_resp.content) // 1024}KB)",
+            }
+        elif status == "failed" or status == "error":
+            error_msg = data.get("error", data.get("message", "Render failed"))
+            return {"error": True, "message": f"Rewind render failed: {error_msg}"}
+        else:
+            return {"status": "processing", "rewind_status": status}
+
+    except Exception as e:
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/rewind-status")
+async def rewind_status():
+    """Check if Rewind API key is configured."""
+    return {
+        "configured": bool(REWIND_API_KEY),
+        "key_prefix": REWIND_API_KEY[:14] + "..." if REWIND_API_KEY else "none",
+        "models": REWIND_MODELS,
+    }
+
+
+# -----------------------------------------------------------------------------
+# OpenRouter — Real AI Video Generation (Google Veo, MiniMax, Wan, etc.)
+# -----------------------------------------------------------------------------
+class OpenRouterVideoRequest(BaseModel):
+    prompt: str
+    model: str = "google/veo-3.1"
+    duration: int = 5
+    resolution: str = "1080p"
+    aspect_ratio: str = "16:9"
+    generate_audio: bool = True
+
+
+OPENROUTER_MODELS = {
+    "google/veo-3.1": "Google Veo 3.1 — Best quality (1080p)",
+    "minimax/hailuo-3": "MiniMax Hailuo 3 — 2K with audio",
+    "alibaba/wan-3.0": "Alibaba Wan 3.0 — Up to 30s, 1080p",
+    "alibaba/wan-3.0-prime": "Alibaba Wan 3.0 Prime — Best Wan quality",
+    "bytedance/seedance-2.5": "Seedance 2.5 — Up to 30s, cinematic",
+    "bytedance/seedance-2.0-mini": "Seedance 2.0 Mini — Fast 480p/720p",
+    "black-forest-labs/flux-3-video": "FLUX 3 Video — 1080p, 5-20s",
+    "runway/gen-4.5": "Runway Gen 4.5 — 720p, fast",
+}
+
+
+@app.post("/api/generate-openrouter")
+async def generate_openrouter_video(body: OpenRouterVideoRequest):
+    """Generate a real AI video using OpenRouter API.
+    
+    Flow:
+    1. Submit video generation job to OpenRouter
+    2. Return job_id for polling
+    3. Frontend polls /api/openrouter-poll/{job_id}
+    """
+    if not OPENROUTER_API_KEY:
+        return {"error": True, "message": "OpenRouter API key not configured"}
+
+    try:
+        logger.info(f"OpenRouter: submitting video job — prompt='{body.prompt[:60]}', model={body.model}")
+
+        resp = http_requests.post(
+            "https://openrouter.ai/api/v1/videos",
+            json={
+                "model": body.model,
+                "prompt": body.prompt,
+                "duration": body.duration,
+                "resolution": body.resolution,
+                "aspect_ratio": body.aspect_ratio,
+                "generate_audio": body.generate_audio,
+            },
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://aeo.creations",
+                "X-Title": "aeo.creations",
+            },
+            timeout=30,
+        )
+
+        start_data = resp.json()
+        logger.info(f"OpenRouter response: {start_data}")
+
+        if resp.status_code not in (200, 201, 202) or not start_data.get("id"):
+            error_msg = start_data.get("error", start_data.get("message", "Unknown error"))
+            return {"error": True, "message": f"OpenRouter rejected: {error_msg}"}
+
+        job_id = start_data["id"]
+        polling_url = start_data.get("polling_url", f"https://openrouter.ai/api/v1/videos/{job_id}")
+        logger.info(f"OpenRouter job submitted: {job_id}")
+
+        record_call("openrouter", "ok")
+        return {
+            "status": "submitted",
+            "job_id": job_id,
+            "polling_url": polling_url,
+            "model": body.model,
+            "message": f"OpenRouter video render started (job: {job_id})",
+        }
+
+    except Exception as e:
+        logger.error(f"OpenRouter error: {str(e)}")
+        record_call("openrouter", "error")
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/openrouter-poll/{job_id}")
+async def openrouter_poll(job_id: str):
+    """Poll OpenRouter job status and download video when done."""
+    if not OPENROUTER_API_KEY:
+        return {"error": True, "message": "OpenRouter not configured"}
+
+    try:
+        resp = http_requests.get(
+            f"https://openrouter.ai/api/v1/videos/{job_id}",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": "https://aeo.creations",
+            },
+            timeout=15,
+        )
+
+        data = resp.json()
+        status = data.get("status", "unknown")
+
+        if status == "completed":
+            # Get the video content URL
+            content_url = data.get("unsigned_urls", [None])[0]
+            if not content_url:
+                # Try the content endpoint directly
+                content_url = f"https://openrouter.ai/api/v1/videos/{job_id}/content?index=0"
+
+            # Download the rendered video
+            vid_resp = http_requests.get(
+                content_url,
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                timeout=120,
+            )
+            vid_name = f"openrouter_{secrets.token_hex(8)}.mp4"
+            vid_path = OUTPUT_DIR / vid_name
+            vid_path.write_bytes(vid_resp.content)
+
+            cost = data.get("usage", {}).get("cost", 0)
+            return {
+                "status": "completed",
+                "video_url": f"/api/file/{vid_name}",
+                "source": "openrouter",
+                "cost": cost,
+                "message": f"Video ready ({len(vid_resp.content) // 1024}KB, cost: ${cost:.4f})",
+            }
+        elif status == "failed":
+            error_msg = data.get("error", "Render failed")
+            return {"error": True, "message": f"OpenRouter render failed: {error_msg}"}
+        else:
+            return {"status": "processing", "or_status": status}
+
+    except Exception as e:
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/openrouter-status")
+async def openrouter_status():
+    """Check if OpenRouter API key is configured."""
+    return {
+        "configured": bool(OPENROUTER_API_KEY),
+        "key_prefix": OPENROUTER_API_KEY[:14] + "..." if OPENROUTER_API_KEY else "none",
+        "models": OPENROUTER_MODELS,
+    }
+
+
+@app.post("/api/generate-pixverse")
+async def generate_pixverse_video(body: PixVerseRequest):
+    """Generate REAL AI video using PixVerse API."""
+    if not PIXVERSE_API_KEY:
+        return {"error": True, "message": "PixVerse API key not configured"}
+
+    try:
+        import uuid as _uuid
+
+        # Step 1: Submit generation job
+        trace_id = str(_uuid.uuid4())
+        resp = http_requests.post(
+            "https://app-api.pixverse.ai/openapi/v2/video/text/generate",
+            json={
+                "prompt": body.prompt,
+                "model": "v6",
+                "aspect_ratio": body.aspect_ratio,
+                "duration": body.duration,
+                "quality": body.quality,
+                "motion_mode": "normal",
+                "water_mark": False,
+            },
+            headers={
+                "API-KEY": PIXVERSE_API_KEY,
+                "Ai-trace-id": trace_id,
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+
+        start_data = resp.json()
+        logger.info(f"PixVerse response: {start_data}")
+
+        if start_data.get("ErrCode") != 0:
+            return {
+                "error": True,
+                "message": start_data.get("ErrMsg", "PixVerse rejected the request"),
+            }
+
+        video_id = start_data["Resp"]["video_id"]
+        logger.info(f"PixVerse job submitted: video_id={video_id}")
+
+        # Step 2: Poll for completion (max 5 minutes)
+        max_attempts = 60
+        for attempt in range(max_attempts):
+            await asyncio.sleep(5)
+
+            check_resp = http_requests.get(
+                f"https://app-api.pixverse.ai/openapi/v2/video/result/{video_id}",
+                headers={
+                    "API-KEY": PIXVERSE_API_KEY,
+                    "Ai-trace-id": str(_uuid.uuid4()),
+                },
+                timeout=15,
+            )
+
+            check_data = check_resp.json()
+            status = check_data.get("Resp", {}).get("status")
+
+            if status == 1:  # Success
+                video_url = check_data["Resp"]["url"]
+                logger.info(f"PixVerse video ready: {video_url}")
+
+                # Download the video
+                vid_resp = http_requests.get(video_url, timeout=60)
+                video_name = f"pixverse_{secrets.token_hex(8)}.mp4"
+                video_path = OUTPUT_DIR / video_name
+                video_path.write_bytes(vid_resp.content)
+
+                record_call("pixverse", "ok")
+                return {
+                    "status": "completed",
+                    "video_url": f"/api/file/{video_name}",
+                    "source": "pixverse-ai",
+                    "video_id": video_id,
+                    "message": f"Real AI video generated via PixVerse ({len(vid_resp.content) // 1024}KB)",
+                }
+
+            elif status == 2:  # Failed
+                record_call("pixverse", "error")
+                return {
+                    "error": True,
+                    "message": "PixVerse video generation failed",
+                }
+
+            # Still processing (status 0)
+            logger.info(f"PixVerse processing... attempt {attempt + 1}/{max_attempts}")
+
+        # Timed out
+        record_call("pixverse", "timeout")
+        return {
+            "error": True,
+            "message": "PixVerse video generation timed out after 5 minutes",
+        }
+
+    except Exception as e:
+        logger.error(f"PixVerse error: {str(e)}")
+        record_call("pixverse", "error")
+        return {"error": True, "message": str(e)}
+
+
+@app.get("/api/pixverse-status")
+async def pixverse_status():
+    """Check if PixVerse API key is configured."""
+    return {
+        "configured": bool(PIXVERSE_API_KEY),
+        "key_prefix": PIXVERSE_API_KEY[:8] + "..." if PIXVERSE_API_KEY else "none",
+    }
+
+
+# -----------------------------------------------------------------------------
+# File serving
+# -----------------------------------------------------------------------------
+@app.get("/api/file/{name}")
+def get_file(name: str):
+    p = OUTPUT_DIR / name
+    if not p.exists() or not p.is_file():
+        raise HTTPException(404, "Not found")
+    media_map = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".mp4": "video/mp4", ".webm": "video/webm",
+    }
+    media = media_map.get(p.suffix.lower(), "application/octet-stream")
+    return FileResponse(p, media_type=media, filename=name)
+
+
+@app.delete("/api/cache")
+def clear_cache():
+    count = 0
+    for f in CACHE_DIR.glob("*"):
+        f.unlink()
+        count += 1
+    for f in OUTPUT_DIR.glob("*"):
+        f.unlink()
+        count += 1
+    return {"cleared": count}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting AI Video Generator on port 8000...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

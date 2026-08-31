@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: aeo-creations
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: MAGIC_HOUR_API_KEY
+        sync: false
+      - key: JSON2VIDEO_API_KEY
+        sync: false
+      - key: REWIND_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: PIXVERSE_API_KEY
+        sync: false
