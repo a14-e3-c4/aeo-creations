@@ -1,14 +1,16 @@
-# Welcome to your Lovable project
+# Pixel Perfect Creations
+
+https://github.com/a14-e3-c4/aeo-creations. finish off from where bolt ai stopped and make this up ready and complete you can also add som adviceable integrations into the app to make it look cooler and professional and to ensure it generates very high quality images and videos with high pixels ad resolutions
 
 This project was built with [Lovable](https://lovable.dev).
 
 ## Build with Lovable
 
-Open your project in the [Lovable editor](https://lovable.dev) and keep building.
+Continue developing this project in the [Lovable editor](https://lovable.dev/projects/0d8f8966-743a-4a00-b977-4646ca83b2c8).
 
 - **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: connect the project to GitHub and every change made in Lovable is committed straight to your repository.
-- **Full ownership**: this code is yours. Push to your repository and your changes sync back into Lovable, ready for your next prompt.
+- **Stay in sync**: every change made in Lovable is committed straight to this repository.
+- **Full ownership**: this code is yours. Push to `main` on GitHub and your changes sync back into Lovable, ready for your next prompt.
 
 ## Development
 
@@ -20,10 +22,3 @@ cd <repository-name>
 npm i
 npm run dev
 ```
-
-## Built with
-
-- TanStack Start
-- TypeScript
-- React
-- Tailwind CSS
