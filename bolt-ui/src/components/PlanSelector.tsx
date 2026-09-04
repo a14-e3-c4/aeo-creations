@@ -20,27 +20,31 @@ export function PlanSelector({ onClose, onUpgraded }: PlanSelectorProps) {
 
   useEffect(() => {
     fetch('/api/plans')
-      .then(r => r.json())
-      .then(d => { setPlans(d.plans || {}); })
-      .catch(() => {})
+      .then(async r => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'Could not load plans');
+        setPlans(data.plans || {});
+      })
+      .catch(e => setError(e instanceof Error ? e.message : 'Could not load plans'))
       .finally(() => setLoading(false));
   }, []);
 
   async function handleUpgrade(planId: string) {
+    if (planId === 'free' || planId === user?.plan) return;
+
     setUpgrading(planId);
     setError('');
     setSuccess('');
     try {
-      const resp = await authFetch('/api/plans/mock-checkout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
+      // This endpoint is deliberately named as a mock/demo flow in the current
+      // backend. It must NOT be treated as a real payment until a payment
+      // provider is connected server-side.
       const url = new URL('/api/plans/mock-checkout', window.location.origin);
       url.searchParams.set('plan_id', planId);
-      const resp2 = await authFetch(url.toString(), { method: 'POST' });
-      const data = await resp2.json();
-      if (!resp2.ok) throw new Error(data.detail || 'Upgrade failed');
-      setSuccess(data.message);
+      const resp = await authFetch(url.toString(), { method: 'POST' });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || 'Upgrade failed');
+      setSuccess(`Demo upgrade complete: ${data.user?.plan || planId}. No payment was charged.`);
       await refreshUser();
       onUpgraded?.();
     } catch (e) {
@@ -53,7 +57,6 @@ export function PlanSelector({ onClose, onUpgraded }: PlanSelectorProps) {
   const planOrder = ['free', 'creator', 'pro'];
   const planIcons: Record<string, typeof Zap> = { free: Zap, creator: Crown, pro: Star };
   const planColors: Record<string, string> = { free: 'text-gray-400', creator: 'text-purple-400', pro: 'text-yellow-400' };
-  const planBg: Record<string, string> = { free: 'bg-gray-500/10', creator: 'bg-purple-500/10', pro: 'bg-yellow-500/10' };
   const planBorder: Record<string, string> = { free: 'border-gray-500/20', creator: 'border-purple-500/20', pro: 'border-yellow-500/20' };
 
   if (loading) {
@@ -74,8 +77,6 @@ export function PlanSelector({ onClose, onUpgraded }: PlanSelectorProps) {
         <div className="text-center mb-6">
           <h2 className="text-xl font-bold">Choose Your Plan</h2>
           <p className="text-xs text-gray-500 mt-1">Unlock more credits, higher quality, and premium features</p>
-
-          {/* Billing toggle */}
           <div className="flex items-center justify-center gap-3 mt-4">
             <button onClick={() => setBillingCycle('monthly')}
               className={`text-xs px-3 py-1 rounded-lg transition-all ${billingCycle === 'monthly' ? 'bg-cyan-500/15 text-cyan-400' : 'text-gray-500'}`}>
@@ -94,7 +95,6 @@ export function PlanSelector({ onClose, onUpgraded }: PlanSelectorProps) {
             <span className="text-xs text-rose-300">{error}</span>
           </div>
         )}
-
         {success && (
           <div className="flex items-center gap-2 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 mb-4">
             <Sparkles size={14} className="text-emerald-400" />
@@ -114,60 +114,27 @@ export function PlanSelector({ onClose, onUpgraded }: PlanSelectorProps) {
 
             return (
               <div key={planId}
-                className={`glass-panel rounded-2xl p-5 border transition-all ${
-                  isCurrent ? 'border-cyan-500/40 bg-cyan-500/5' : planBorder[planId]
-                } ${isPopular ? 'ring-1 ring-purple-500/30' : ''}`}>
-                {isPopular && (
-                  <div className="text-center mb-2">
-                    <span className="text-[10px] font-bold text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded-full">
-                      MOST POPULAR
-                    </span>
-                  </div>
-                )}
-
+                className={`glass-panel rounded-2xl p-5 border transition-all ${isCurrent ? 'border-cyan-500/40 bg-cyan-500/5' : planBorder[planId]} ${isPopular ? 'ring-1 ring-purple-500/30' : ''}`}>
+                {isPopular && <div className="text-center mb-2"><span className="text-[10px] font-bold text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded-full">MOST POPULAR</span></div>}
                 <div className="text-center mb-4">
                   <Icon size={28} className={`mx-auto ${planColors[planId]}`} />
                   <h3 className="text-lg font-bold mt-2">{plan.name}</h3>
-                  <div className="mt-2">
-                    <span className="text-3xl font-bold">${monthlyEquivalent}</span>
-                    <span className="text-xs text-gray-500">/mo</span>
-                  </div>
-                  {billingCycle === 'yearly' && plan.price_yearly > 0 && (
-                    <p className="text-[10px] text-gray-600">${plan.price_yearly}/year</p>
-                  )}
+                  <div className="mt-2"><span className="text-3xl font-bold">${monthlyEquivalent}</span><span className="text-xs text-gray-500">/mo</span></div>
+                  {billingCycle === 'yearly' && plan.price_yearly > 0 && <p className="text-[10px] text-gray-600">${plan.price_yearly}/year</p>}
                   <p className="text-xs text-gray-500 mt-1">{plan.credits_per_month} credits/month</p>
                 </div>
-
                 <ul className="space-y-1.5 mb-4">
                   {plan.features.map((feature, i) => (
-                    <li key={i} className="flex items-start gap-2 text-[11px] text-gray-400">
-                      <Check size={12} className="text-emerald-400 mt-0.5 flex-shrink-0" />
-                      {feature}
-                    </li>
+                    <li key={i} className="flex items-start gap-2 text-[11px] text-gray-400"><Check size={12} className="text-emerald-400 mt-0.5 flex-shrink-0" />{feature}</li>
                   ))}
                 </ul>
-
                 {isCurrent ? (
-                  <div className="w-full py-2.5 rounded-xl text-center text-xs font-medium text-gray-500 border border-white/[0.06]">
-                    Current Plan
-                  </div>
+                  <div className="w-full py-2.5 rounded-xl text-center text-xs font-medium text-gray-500 border border-white/[0.06]">Current Plan</div>
                 ) : (
-                  <button
-                    onClick={() => handleUpgrade(planId)}
-                    disabled={upgrading !== null}
-                    className={`w-full py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all ${
-                      planId === 'pro'
-                        ? 'bg-yellow-500/15 text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/25'
-                        : planId === 'creator'
-                        ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30 hover:bg-purple-500/25'
-                        : 'bg-gray-500/15 text-gray-400 border border-gray-500/30 hover:bg-gray-500/25'
-                    } disabled:opacity-50`}>
-                    {upgrading === planId ? (
-                      <Loader2 size={14} className="animate-spin" />
-                    ) : (
-                      <CreditCard size={14} />
-                    )}
-                    {upgrading === planId ? 'Processing...' : price === 0 ? 'Get Started Free' : 'Upgrade Now'}
+                  <button onClick={() => handleUpgrade(planId)} disabled={upgrading !== null}
+                    className={`w-full py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all ${planId === 'pro' ? 'bg-yellow-500/15 text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/25' : 'bg-purple-500/15 text-purple-400 border border-purple-500/30 hover:bg-purple-500/25'} disabled:opacity-50`}>
+                    {upgrading === planId ? <Loader2 size={14} className="animate-spin" /> : <CreditCard size={14} />}
+                    {upgrading === planId ? 'Processing...' : 'Try Demo Upgrade'}
                   </button>
                 )}
               </div>
@@ -175,8 +142,8 @@ export function PlanSelector({ onClose, onUpgraded }: PlanSelectorProps) {
           })}
         </div>
 
-        <p className="text-center text-[10px] text-gray-600 mt-4">
-          Mock checkout — no real charges. Cancel anytime.
+        <p className="text-center text-[10px] text-amber-500/70 mt-4">
+          Demo billing only — no real charges are made. Connect a payment provider before accepting money.
         </p>
       </div>
     </div>
