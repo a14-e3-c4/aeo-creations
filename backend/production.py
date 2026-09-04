@@ -5,16 +5,21 @@ when Render is configured to start `backend.production:app`:
 - atomic Supabase credit reservation/refund around billable generation routes
 - real Paystack transaction initialization + verification + signed webhook
 - server-side price/plan validation and idempotent payment fulfillment
+- premium automatic single-image cinematic animation using the exact generated image
 
 Without production environment variables, local/demo behavior remains intact.
 """
 from __future__ import annotations
+import asyncio
+import base64
 import hashlib, hmac, json, os, uuid
+from pathlib import Path
 import requests
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send, Message
 from backend.main import app
+from backend.cinematic_animation import render_cinematic_animation, MAX_IMAGE_BYTES
 import store
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
@@ -22,7 +27,6 @@ PAYSTACK_BASE_URL = "https://api.paystack.co"
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").rstrip("/")
 PAYSTACK_CURRENCY = os.getenv("PAYSTACK_CURRENCY", "USD").upper()
 
-# Internal product credit costs. Provider charges never come from the browser.
 BILLABLE_COSTS = {
     "/api/generate": ("video", 2),
     "/api/generate-hf-image": ("image", 1),
@@ -79,6 +83,64 @@ class CreditMiddleware:
         if not reservation.get("allowed"):
             await self._error(send, 402, reservation.get("reason", "Insufficient credits"), {"remaining": reservation.get("remaining", 0)}); return
 
+        # The Generate UI sends image_b64 when it wants the image it just made
+        # animated. Handle that exact image here, after the credit reservation,
+        # so the animation cannot bypass billing and never regenerates the image.
+        if scope.get("path") == "/api/generate":
+            body = bytearray()
+            while True:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    continue
+                body.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            try:
+                payload_body = json.loads(bytes(body).decode("utf-8"))
+            except Exception:
+                payload_body = {}
+
+            image_b64 = payload_body.get("image_b64")
+            if image_b64:
+                try:
+                    raw = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
+                    image_bytes = base64.b64decode(raw, validate=True)
+                    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+                        raise ValueError("Invalid image size")
+                    from PIL import Image
+                    with Image.open(__import__("io").BytesIO(image_bytes)) as image:
+                        image.verify()
+
+                    effect = str(payload_body.get("kb_effect") or "zoom-in")
+                    duration = max(1.0, min(float(payload_body.get("kb_duration") or 5), 30.0))
+                    from backend.main import OUTPUT_DIR
+                    video_name = f"auto_cinematic_{uuid.uuid4().hex[:12]}.mp4"
+                    video_path = OUTPUT_DIR / video_name
+                    await asyncio.to_thread(render_cinematic_animation, image_bytes, video_path, effect, duration)
+                    if not video_path.exists() or video_path.stat().st_size == 0:
+                        raise RuntimeError("Animation output was not created")
+
+                    url = f"/api/file/{video_name}"
+                    data = json.dumps({
+                        "status": "ok", "cached": False, "file": url,
+                        "video": url, "video_url": url, "image": image_b64,
+                        "message": f"Cinematic animation complete ({effect}, 30fps, 1080p).",
+                    }).encode()
+                    await send({"type":"http.response.start","status":200,"headers":[(b"content-type",b"application/json"),(b"content-length",str(len(data)).encode())]})
+                    await send({"type":"http.response.body","body":data})
+                    store.finalize_reservation(reservation.get("reservation_id"), amount)
+                    return
+                except Exception:
+                    # Fall through to the original /api/generate route if the
+                    # cinematic renderer cannot process the supplied image.
+                    pass
+
+            async def replay_receive():
+                return {"type":"http.request","body":bytes(body),"more_body":False}
+            receive_for_app = replay_receive
+        else:
+            receive_for_app = receive
+
         response_status = 500; response_body = bytearray()
         async def capture(message: Message):
             nonlocal response_status
@@ -86,12 +148,12 @@ class CreditMiddleware:
             elif message["type"] == "http.response.body": response_body.extend(message.get("body", b""))
             await send(message)
         try:
-            await self.app(scope, receive, capture)
+            await self.app(scope, receive_for_app, capture)
             failed = response_status >= 400
             if not failed and response_body:
                 try:
-                    body = json.loads(response_body.decode())
-                    failed = bool(body.get("error")) or body.get("status") in {"failed", "error"}
+                    body_json = json.loads(response_body.decode())
+                    failed = bool(body_json.get("error")) or body_json.get("status") in {"failed", "error"}
                 except Exception: pass
             if failed: store.refund_reservation(reservation.get("reservation_id"), f"http_{response_status}")
             else: store.finalize_reservation(reservation.get("reservation_id"), amount)
