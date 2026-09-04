@@ -983,8 +983,9 @@ class ScriptResponse(BaseModel):
 
 
 @app.post("/api/generate-script")
-async def generate_script(body: ScriptRequest):
+async def generate_script(request: Request, body: ScriptRequest):
     """Generate a video script with scenes using Groq AI."""
+    _enforce_credits(request, "script")
     if not groq_client:
         raise HTTPException(400, "Groq API not configured. Add GROQ_API_KEY to .env file.")
 
@@ -1086,11 +1087,12 @@ class AIVideoRequest(BaseModel):
 
 
 @app.post("/api/generate-ai-video")
-async def generate_ai_video(body: AIVideoRequest):
+async def generate_ai_video(request: Request, body: AIVideoRequest):
     """
     Submit an AI video generation job to Magic Hour.
     Returns immediately with a job ID for polling.
     """
+    _enforce_credits(request, "magic-hour")
     if not MAGIC_HOUR_API_KEY:
         raise HTTPException(400, "Magic Hour API not configured. Add MAGIC_HOUR_API_KEY to .env")
 
@@ -1287,8 +1289,9 @@ async def get_video_status(job_id: str):
 # MODAL CLOUD GPU — PREMIUM FLUX.1-DEV IMAGE GENERATION
 # =============================================================================
 @app.post("/api/modal-generate")
-def api_modal_generate(body: dict):
+def api_modal_generate(request: Request, body: dict):
     """Generate premium image via Modal cloud GPU (FLUX.1-dev on A10G)."""
+    _enforce_credits(request, "image")
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(400, "prompt is required")
@@ -1310,8 +1313,9 @@ def api_modal_generate(body: dict):
 # IMAGE GENERATION — Gemini → Modal → Pollinations (free fallback)
 # =============================================================================
 @app.post("/api/generate-hf-image")
-def generate_hf_image(body: dict):
+def generate_hf_image(request: Request, body: dict):
     """Generate image: Gemini (best) → Modal FLUX → Pollinations (free)."""
+    _enforce_credits(request, "image")
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(400, "prompt is required")
@@ -1396,8 +1400,10 @@ def generate_hf_image(body: dict):
 # IMAGE + KEN BURNS VIDEO GENERATION (existing HF pipeline)
 # =============================================================================
 @app.post("/api/generate")
-def generate(req: GenerateRequest):
+def generate(request: Request, req: GenerateRequest):
     """Generate an AI image and optionally convert to MP4 video."""
+    action = "video" if req.kb_effect else "image"
+    _enforce_credits(request, action)
     err = preflight(req)
     if err:
         raise HTTPException(status_code=400, detail=err)
@@ -1947,8 +1953,9 @@ def _kling_headers():
 
 
 @app.post("/api/generate-kling-image")
-async def generate_kling_image(body: KlingImageRequest):
+async def generate_kling_image(request: Request, body: KlingImageRequest):
     """Generate an image using Kling AI image generation."""
+    _enforce_credits(request, "kling-image")
     if not KLING_API_KEY:
         raise HTTPException(500, "KLING_API_KEY not configured")
     
@@ -1985,10 +1992,11 @@ async def generate_kling_image(body: KlingImageRequest):
 
 
 @app.post("/api/generate-kling")
-async def generate_kling_video(body: KlingRequest):
+async def generate_kling_video(request: Request, body: KlingRequest):
     """Generate REAL AI video using Kling AI (image-to-video).
     Quick check: if Kling is down, return immediately so frontend falls back to Ken Burns.
     """
+    _enforce_credits(request, "kling-video")
     if not KLING_API_KEY:
         raise HTTPException(500, "KLING_API_KEY not configured")
     
@@ -2701,8 +2709,9 @@ CONTENT_TYPE_PROMPTS = {
 
 
 @app.post("/api/create-video/generate-hook")
-async def create_video_generate_hook(body: CreateVideoHookRequest):
+async def create_video_generate_hook(request: Request, body: CreateVideoHookRequest):
     """Step 6: Generate an engaging hook for the video."""
+    _enforce_credits(request, "script")
     if not groq_client:
         raise HTTPException(400, "Groq API not configured")
 
@@ -2744,8 +2753,9 @@ Return ONLY the hook text, no quotes, no explanation.
 
 
 @app.post("/api/create-video/generate-script")
-async def create_video_generate_script(body: CreateVideoScriptRequest):
+async def create_video_generate_script(request: Request, body: CreateVideoScriptRequest):
     """Step 7: Generate structured script with scenes and voiceover."""
+    _enforce_credits(request, "script")
     if not groq_client:
         raise HTTPException(400, "Groq API not configured")
 
@@ -2836,8 +2846,9 @@ Rules:
 
 
 @app.post("/api/create-video/generate-scene-image")
-async def create_video_generate_scene_image(body: CreateVideoSceneImageRequest):
+async def create_video_generate_scene_image(request: Request, body: CreateVideoSceneImageRequest):
     """Step 10: Generate image for a single scene using Pollinations.ai."""
+    _enforce_credits(request, "image")
     import urllib.parse
     prompt = body.visual_prompt
     if body.style and body.style not in prompt.lower():
@@ -2884,8 +2895,9 @@ async def create_video_generate_scene_image(body: CreateVideoSceneImageRequest):
 
 
 @app.post("/api/create-video/assemble")
-async def create_video_assemble(body: CreateVideoAssembleRequest):
+async def create_video_assemble(request: Request, body: CreateVideoAssembleRequest):
     """Step 11: Assemble scene images + voiceovers into a final MP4 video."""
+    _enforce_credits(request, "assemble")
     if not MOVIEPY_AVAILABLE:
         raise HTTPException(500, "moviepy not available — cannot assemble video")
 
@@ -3295,8 +3307,9 @@ async def list_voices():
 
 
 @app.post("/api/generate-voiceover")
-async def generate_voiceover(body: VoiceoverRequest):
+async def generate_voiceover(request: Request, body: VoiceoverRequest):
     """Generate TTS voiceover audio for each scene's voiceover text."""
+    _enforce_credits(request, "voiceover")
     if not TTS_AVAILABLE:
         raise HTTPException(400, "TTS not available. Install: pip install edge-tts")
 
@@ -3474,6 +3487,55 @@ def _require_user(request) -> dict:
     user = _get_current_user(request)
     if not user:
         raise HTTPException(401, "Authentication required")
+    return user
+
+
+# ── Server-side credit enforcement ───────────────────────────────────────────
+# Every generation endpoint MUST call _enforce_credits() before doing expensive
+# work.  This prevents unauthenticated / under-credited calls from bypassing
+# the frontend check.
+
+# action_type → (credits_cost, display_name)
+CREDIT_COSTS = {
+    "image": (1, "image generation"),
+    "video": (4, "video generation"),
+    "script": (1, "script generation"),
+    "voiceover": (2, "voiceover generation"),
+    "assemble": (4, "video assembly"),
+    "kling-image": (2, "Kling image"),
+    "kling-video": (6, "Kling video"),
+    "magic-hour": (8, "Magic Hour video"),
+    "json2video": (6, "JSON2Video"),
+    "rewind": (8, "Rewind AI video"),
+    "openrouter": (10, "OpenRouter video"),
+    "pixverse": (8, "PixVerse video"),
+    "ngrok-video": (6, "Ngrok video"),
+}
+
+
+def _enforce_credits(request, action_type: str) -> Optional[dict]:
+    """Check credits and deduct them when user is authenticated.
+
+    Returns the user dict if authenticated, None if anonymous.
+    Raises HTTPException(402) if authenticated but insufficient credits.
+    Anonymous users are allowed through (demo/free access) but are not tracked.
+    """
+    user = _get_current_user(request)
+    if not user:
+        return None  # Anonymous — allow without credit check
+
+    credits_cost, label = CREDIT_COSTS.get(action_type, (1, action_type))
+    check = store.check_generation_limit(user["id"], action_type, credits_cost)
+    if not check.get("allowed"):
+        raise HTTPException(
+            402,
+            check.get("reason", "Insufficient credits"),
+        )
+
+    # Deduct credits
+    store.record_usage(user["id"], action_type, "api", "pending", credits_cost)
+    # Refresh user object so downstream code sees updated balance
+    user = store.get_user(user["id"]) or user
     return user
 
 
