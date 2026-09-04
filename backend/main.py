@@ -2987,6 +2987,440 @@ async def create_video_platforms():
     }
 
 
+# =============================================================================
+# VOICEOVER & CAPTION PIPELINE — Edge-TTS + FFmpeg subtitle burning
+# =============================================================================
+
+import asyncio as _asyncio
+import subprocess as _subprocess
+import re as _re
+
+# Try importing edge-tts
+try:
+    import edge_tts
+    TTS_AVAILABLE = True
+    logger.info("edge-tts available — voiceover generation enabled")
+except ImportError:
+    TTS_AVAILABLE = False
+    logger.warning("edge-tts not installed — voiceover generation unavailable")
+
+# Popular Edge TTS voices (free, high quality)
+TTS_VOICES = [
+    {"id": "en-US-AriaNeural", "name": "Aria", "gender": "Female", "style": "Warm, natural"},
+    {"id": "en-US-GuyNeural", "name": "Guy", "gender": "Male", "style": "Friendly, conversational"},
+    {"id": "en-US-JennyNeural", "name": "Jenny", "gender": "Female", "style": "Professional, clear"},
+    {"id": "en-US-AvaNeural", "name": "Ava", "gender": "Female", "style": "Soft, gentle"},
+    {"id": "en-US-AndrewNeural", "name": "Andrew", "gender": "Male", "style": "Deep, authoritative"},
+    {"id": "en-US-BrianNeural", "name": "Brian", "gender": "Male", "style": "Calm, measured"},
+    {"id": "en-US-EmmaNeural", "name": "Emma", "gender": "Female", "style": "Energetic, upbeat"},
+    {"id": "en-US-DavisNeural", "name": "Davis", "gender": "Male", "style": "Confident, bold"},
+    {"id": "en-US-MichelleNeural", "name": "Michelle", "gender": "Female", "style": "Caring, warm"},
+    {"id": "en-US-RyanNeural", "name": "Ryan", "gender": "Male", "style": "Neutral, versatile"},
+    {"id": "en-GB-SoniaNeural", "name": "Sonia (UK)", "gender": "Female", "style": "British, refined"},
+    {"id": "en-GB-RyanNeural", "name": "Ryan (UK)", "gender": "Male", "style": "British, authoritative"},
+    {"id": "en-AU-NatashaNeural", "name": "Natasha (AU)", "gender": "Female", "style": "Australian, friendly"},
+    {"id": "en-AU-WilliamNeural", "name": "William (AU)", "gender": "Male", "style": "Australian, deep"},
+]
+
+# FFmpeg path (from imageio_ffmpeg)
+FFMPEG_BIN = FFMPEG_PATH
+
+
+async def _edge_tts_generate(text: str, voice: str, output_path: str) -> None:
+    """Generate speech audio using edge-tts (free Microsoft Edge voices)."""
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
+
+
+def generate_voiceover_sync(text: str, voice: str, output_path: str) -> None:
+    """Synchronous wrapper for edge-tts generation."""
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_edge_tts_generate(text, voice, output_path))
+    finally:
+        loop.close()
+
+
+def get_audio_duration(audio_path: str) -> float:
+    """Get duration of an audio file in seconds using ffprobe."""
+    try:
+        probe_cmd = [
+            FFMPEG_BIN, "-i", audio_path,
+            "-f", "null", "-"
+        ]
+        result = _subprocess.run(
+            probe_cmd, capture_output=True, text=True, timeout=10
+        )
+        # Parse duration from stderr
+        for line in result.stderr.split("\n"):
+            if "Duration:" in line:
+                match = _re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", line)
+                if match:
+                    h, m, s = float(match.group(1)), float(match.group(2)), float(match.group(3))
+                    return h * 3600 + m * 60 + s
+    except Exception:
+        pass
+    return 5.0  # fallback
+
+
+def split_text_for_captions(text: str, max_words: int = 8) -> List[str]:
+    """Split text into caption chunks, each with max_words words."""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), max_words):
+        chunk = " ".join(words[i:i + max_words])
+        if chunk.strip():
+            chunks.append(chunk.strip())
+    return chunks if chunks else [text]
+
+
+def generate_timed_captions(
+    voiceovers: List[str],
+    durations: List[float],
+    max_words_per_chunk: int = 8,
+) -> List[dict]:
+    """
+    Generate timed caption entries from voiceover texts and scene durations.
+    Each caption has: start_time, end_time, text, scene_index.
+    """
+    all_captions = []
+    current_time = 0.0
+
+    for scene_idx, (voiceover, dur) in enumerate(zip(voiceovers, durations)):
+        if not voiceover.strip():
+            current_time += dur
+            continue
+
+        chunks = split_text_for_captions(voiceover, max_words_per_chunk)
+        time_per_chunk = dur / max(len(chunks), 1)
+
+        for chunk_idx, chunk in enumerate(chunks):
+            start = current_time + (chunk_idx * time_per_chunk)
+            end = start + time_per_chunk
+            all_captions.append({
+                "start_time": round(start, 3),
+                "end_time": round(min(end, current_time + dur), 3),
+                "text": chunk,
+                "scene_index": scene_idx,
+            })
+
+        current_time += dur
+
+    return all_captions
+
+
+def captions_to_srt(captions: List[dict]) -> str:
+    """Convert caption list to SRT format string."""
+    srt_lines = []
+    for i, cap in enumerate(captions, 1):
+        start = _seconds_to_srt_time(cap["start_time"])
+        end = _seconds_to_srt_time(cap["end_time"])
+        srt_lines.append(f"{i}")
+        srt_lines.append(f"{start} --> {end}")
+        srt_lines.append(cap["text"])
+        srt_lines.append("")
+    return "\n".join(srt_lines)
+
+
+def captions_to_ass(captions: List[dict], style: str = "clean") -> str:
+    """Convert caption list to ASS (Advanced SubStation Alpha) format with styled subtitles."""
+    # Caption style presets
+    styles = {
+        "clean": {
+            "fontname": "Arial",
+            "fontsize": 42,
+            "primary_color": "&H00FFFFFF",
+            "outline_color": "&H00000000",
+            "back_color": "&H80000000",
+            "bold": 0,
+            "outline": 2,
+            "shadow": 1,
+            "alignment": 2,
+            "margin_v": 50,
+        },
+        "bold": {
+            "fontname": "Impact",
+            "fontsize": 52,
+            "primary_color": "&H00FFFFFF",
+            "outline_color": "&H00000000",
+            "back_color": "&H00000000",
+            "bold": -1,
+            "outline": 4,
+            "shadow": 2,
+            "alignment": 2,
+            "margin_v": 50,
+        },
+        "highlight": {
+            "fontname": "Arial",
+            "fontsize": 44,
+            "primary_color": "&H0000FFFF",
+            "outline_color": "&H00000000",
+            "back_color": "&H80000000",
+            "bold": -1,
+            "outline": 3,
+            "shadow": 1,
+            "alignment": 2,
+            "margin_v": 50,
+        },
+        "minimal": {
+            "fontname": "Arial",
+            "fontsize": 36,
+            "primary_color": "&H00E0E0E0",
+            "outline_color": "&H00000000",
+            "back_color": "&H00000000",
+            "bold": 0,
+            "outline": 1,
+            "shadow": 0,
+            "alignment": 2,
+            "margin_v": 60,
+        },
+    }
+    s = styles.get(style, styles["clean"])
+
+    header = f"""[Script Info]
+Title: aeo.creations Captions
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{s['fontname']},{s['fontsize']},{s['primary_color']},&H000000FF,{s['outline_color']},{s['back_color']},{s['bold']},0,0,0,100,100,0,0,1,{s['outline']},{s['shadow']},{s['alignment']},20,20,{s['margin_v']},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    lines = [header]
+    for cap in captions:
+        start = _seconds_to_ass_time(cap["start_time"])
+        end = _seconds_to_ass_time(cap["end_time"])
+        # Escape special characters for ASS
+        text = cap["text"].replace("\\", "\\\\").replace("{", "\\{" ).replace("}", "\\}")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+
+    return "\n".join(lines)
+
+
+def _seconds_to_srt_time(seconds: float) -> str:
+    """Convert seconds to SRT time format HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _seconds_to_ass_time(seconds: float) -> str:
+    """Convert seconds to ASS time format H:MM:SS.cc"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int((seconds % 1) * 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def burn_captions_ffmpeg(
+    video_path: str,
+    subtitle_text: str,
+    output_path: str,
+    is_ass: bool = True,
+) -> None:
+    """Burn captions into video using FFmpeg subtitles filter."""
+    # Write subtitle file
+    sub_ext = ".ass" if is_ass else ".srt"
+    sub_file = tempfile.NamedTemporaryFile(suffix=sub_ext, delete=False, mode="w", encoding="utf-8")
+    sub_file.write(subtitle_text)
+    sub_file.close()
+
+    # FFmpeg subtitle filter needs forward slashes on Windows
+    sub_path_escaped = sub_file.name.replace("\\", "/").replace(":", "\\:")
+
+    if is_ass:
+        filter_str = f"subtitles='{sub_path_escaped}'"
+    else:
+        filter_str = f"subtitles='{sub_path_escaped}':force_style='FontSize=24,FontName=Arial'"
+
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", video_path,
+        "-vf", filter_str,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    try:
+        result = _subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.error(f"FFmpeg caption burn error: {result.stderr[:500]}")
+            raise RuntimeError(f"FFmpeg failed: {result.stderr[:200]}")
+    finally:
+        try:
+            os.unlink(sub_file.name)
+        except Exception:
+            pass
+
+
+# ── Request models ────────────────────────────────────────────────────────────
+
+class VoiceoverRequest(BaseModel):
+    """Generate TTS voiceover for a list of voiceover texts."""
+    voiceovers: List[str]
+    voice: str = Field(default="en-US-AriaNeural")
+
+
+class CaptionStyleRequest(BaseModel):
+    """Generate timed captions from voiceovers and durations."""
+    voiceovers: List[str]
+    durations: List[float]
+    style: str = Field(default="clean")
+    max_words_per_chunk: int = Field(default=8, ge=3, le=15)
+
+
+class CaptionEditRequest(BaseModel):
+    """Burn edited captions into video."""
+    captions: List[dict]  # [{start_time, end_time, text}]
+    video_url: str
+    style: str = Field(default="clean")
+    job_id: str = Field(default="")
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/voices")
+async def list_voices():
+    """List available TTS voices."""
+    return {
+        "available": TTS_AVAILABLE,
+        "voices": TTS_VOICES,
+        "message": "Edge TTS voices are free and require no API key" if TTS_AVAILABLE else "Install edge-tts: pip install edge-tts",
+    }
+
+
+@app.post("/api/generate-voiceover")
+async def generate_voiceover(body: VoiceoverRequest):
+    """Generate TTS voiceover audio for each scene's voiceover text."""
+    if not TTS_AVAILABLE:
+        raise HTTPException(400, "TTS not available. Install: pip install edge-tts")
+
+    voice = body.voice
+    # Validate voice exists
+    valid_ids = {v["id"] for v in TTS_VOICES}
+    if voice not in valid_ids:
+        voice = "en-US-AriaNeural"  # fallback
+
+    audio_files = []
+    durations = []
+
+    try:
+        for i, text in enumerate(body.voiceovers):
+            if not text.strip():
+                audio_files.append("")
+                durations.append(5.0)
+                continue
+
+            # Generate audio
+            audio_path = OUTPUT_DIR / f"voiceover_{i}_{int(time.time())}.mp3"
+            generate_voiceover_sync(text, voice, str(audio_path))
+
+            # Get duration
+            dur = get_audio_duration(str(audio_path))
+
+            audio_files.append(f"/api/file/{audio_path.name}")
+            durations.append(round(dur, 2))
+
+        record_call("generate-voiceover", "ok")
+        return {
+            "status": "ok",
+            "audio_files": audio_files,
+            "durations": durations,
+            "total_duration": round(sum(durations), 2),
+            "voice": voice,
+            "message": f"Generated {len(body.voiceovers)} voiceover clips ({sum(durations):.1f}s total)",
+        }
+    except Exception as e:
+        record_call("generate-voiceover", "error")
+        raise HTTPException(500, f"Voiceover generation failed: {str(e)[:200]}")
+
+
+@app.post("/api/generate-captions")
+async def generate_captions(body: CaptionStyleRequest):
+    """Generate timed captions from voiceover texts and scene durations."""
+    try:
+        captions = generate_timed_captions(
+            body.voiceovers,
+            body.durations,
+            body.max_words_per_chunk,
+        )
+
+        srt_content = captions_to_srt(captions)
+        ass_content = captions_to_ass(captions, body.style)
+
+        record_call("generate-captions", "ok")
+        return {
+            "status": "ok",
+            "captions": captions,
+            "srt": srt_content,
+            "ass": ass_content,
+            "count": len(captions),
+            "style": body.style,
+            "message": f"Generated {len(captions)} caption entries in {body.style} style",
+        }
+    except Exception as e:
+        record_call("generate-captions", "error")
+        raise HTTPException(500, f"Caption generation failed: {str(e)[:200]}")
+
+
+@app.post("/api/burn-captions")
+async def burn_captions_endpoint(body: CaptionEditRequest):
+    """Burn edited captions into a video file."""
+    try:
+        # Resolve video path from URL
+        video_filename = body.video_url.split("/api/file/")[-1]
+        video_path = OUTPUT_DIR / video_filename
+        if not video_path.exists():
+            raise HTTPException(404, f"Video file not found: {video_filename}")
+
+        # Convert captions to ASS
+        ass_content = captions_to_ass(body.captions, body.style)
+
+        # Output file
+        job_id = body.job_id or uuid.uuid4().hex[:12]
+        out_filename = f"captioned_{job_id}.mp4"
+        out_path = OUTPUT_DIR / out_filename
+
+        # Burn captions with FFmpeg
+        burn_captions_ffmpeg(str(video_path), ass_content, str(out_path), is_ass=True)
+
+        record_call("burn-captions", "ok")
+        return {
+            "status": "ok",
+            "video_url": f"/api/file/{out_filename}",
+            "filename": out_filename,
+            "message": f"Captions burned in {body.style} style",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        record_call("burn-captions", "error")
+        raise HTTPException(500, f"Caption burning failed: {str(e)[:200]}")
+
+
+@app.get("/api/caption-styles")
+async def caption_styles():
+    """Return available caption styles."""
+    return {
+        "styles": [
+            {"id": "clean", "label": "Clean", "desc": "White text, black outline, classic look", "icon": "Aa"},
+            {"id": "bold", "label": "Bold", "desc": "Large Impact font, heavy outline", "icon": "AB"},
+            {"id": "highlight", "label": "Highlight", "desc": "Yellow text, bold, eye-catching", "icon": "⚡"},
+            {"id": "minimal", "label": "Minimal", "desc": "Subtle gray, thin outline, understated", "icon": "–"},
+        ],
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting AI Video Generator on port 8000...")
