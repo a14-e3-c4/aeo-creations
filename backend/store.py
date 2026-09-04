@@ -1,19 +1,20 @@
 """
 File-based data store for aeo.creations — users, plans, projects, usage.
 
-Replace with Supabase/Postgres for production.
-All data lives in backend/data/ as JSON files.
+This is suitable for local development and single-instance demos. For production,
+replace it with Supabase/Postgres so concurrent requests, scaling, backups and
+transactions are handled by a real database.
 """
 
 import json
 import hashlib
 import secrets
-import time
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, List
 
 DATA_DIR = Path(__file__).parent / "data"
+DEFAULT_PLANS_FILE = Path(__file__).parent / "default_plans.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── File helpers ──────────────────────────────────────────────────────────────
@@ -30,13 +31,23 @@ def _read(filename: str) -> dict:
 
 def _write(filename: str, data: dict) -> None:
     p = DATA_DIR / filename
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
 
 
 # ── Plans ─────────────────────────────────────────────────────────────────────
 
 def get_plans() -> dict:
-    return _read("plans.json").get("plans", {})
+    """Load runtime plans, falling back to version-controlled defaults."""
+    runtime = _read("plans.json").get("plans")
+    if runtime:
+        return runtime
+    try:
+        defaults = json.loads(DEFAULT_PLANS_FILE.read_text(encoding="utf-8"))
+        return defaults.get("plans", {})
+    except Exception:
+        return {}
 
 
 def get_plan(plan_id: str) -> Optional[dict]:
@@ -47,42 +58,68 @@ def plan_ids() -> List[str]:
     return list(get_plans().keys())
 
 
-# ── Users ─────────────────────────────────────────────────────────────────────
+# ── Password hashing ─────────────────────────────────────────────────────────
+# PBKDF2-HMAC-SHA256 is intentionally implemented with only Python stdlib so
+# deployment does not need another dependency. Existing legacy SHA-256 hashes
+# are still accepted once and transparently upgraded after a successful login.
+PASSWORD_ITERATIONS = 310_000
+
 
 def _hash_password(password: str, salt: str = "") -> str:
-    if not salt:
-        salt = secrets.token_hex(16)
-    hashed = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
-    return f"{salt}:{hashed}"
+    salt_bytes = bytes.fromhex(salt) if salt else secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt_bytes, PASSWORD_ITERATIONS
+    )
+    return f"pbkdf2_sha256:{PASSWORD_ITERATIONS}:{salt_bytes.hex()}:{derived.hex()}"
 
 
-def _verify_password(stored: str, password: str) -> bool:
+def _verify_password(stored: str, password: str) -> tuple[bool, bool]:
+    """Return (valid, needs_upgrade)."""
     parts = stored.split(":")
-    if len(parts) != 2:
-        return False
-    salt, expected_hash = parts
-    test_hash = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
-    return secrets.compare_digest(test_hash, expected_hash)
+    if len(parts) == 4 and parts[0] == "pbkdf2_sha256":
+        try:
+            iterations = int(parts[1])
+            salt = bytes.fromhex(parts[2])
+            expected = bytes.fromhex(parts[3])
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+            return secrets.compare_digest(actual, expected), iterations != PASSWORD_ITERATIONS
+        except (ValueError, TypeError):
+            return False, False
 
+    # Legacy format: salt:sha256(salt + password). Keep compatibility and
+    # transparently migrate successful logins to PBKDF2.
+    if len(parts) == 2:
+        salt, expected_hash = parts
+        test_hash = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+        return secrets.compare_digest(test_hash, expected_hash), True
+
+    return False, False
+
+
+# ── Users ─────────────────────────────────────────────────────────────────────
 
 def create_user(email: str, password: str, display_name: str = "") -> dict:
     users = _read("users.json")
+    email = email.lower().strip()
+    if not email or "@" not in email:
+        raise ValueError("Please enter a valid email address")
 
     # Check duplicate
-    for uid, user in users.items():
-        if user.get("email", "").lower() == email.lower():
+    for user in users.values():
+        if user.get("email", "").lower() == email:
             raise ValueError("Email already registered")
 
     uid = secrets.token_hex(16)
     now = datetime.utcnow().isoformat()
+    free_plan = get_plan("free") or {}
     users[uid] = {
         "id": uid,
-        "email": email.lower().strip(),
+        "email": email,
         "password_hash": _hash_password(password),
-        "display_name": display_name or email.split("@")[0],
+        "display_name": display_name.strip() or email.split("@")[0],
         "avatar_url": None,
         "plan": "free",
-        "credits_remaining": get_plans().get("free", {}).get("credits_per_month", 50),
+        "credits_remaining": free_plan.get("credits_per_month", 50),
         "credits_used_this_month": 0,
         "billing_cycle_start": now,
         "created_at": now,
@@ -97,9 +134,13 @@ def create_user(email: str, password: str, display_name: str = "") -> dict:
 
 def authenticate_user(email: str, password: str) -> Optional[dict]:
     users = _read("users.json")
+    normalized = email.lower().strip()
     for uid, user in users.items():
-        if user.get("email", "").lower() == email.lower():
-            if _verify_password(user["password_hash"], password):
+        if user.get("email", "").lower() == normalized:
+            valid, needs_upgrade = _verify_password(user.get("password_hash", ""), password)
+            if valid:
+                if needs_upgrade:
+                    user["password_hash"] = _hash_password(password)
                 user["last_login"] = datetime.utcnow().isoformat()
                 _write("users.json", users)
                 return _sanitize_user(user)
@@ -198,9 +239,7 @@ def get_project(project_id: str) -> Optional[dict]:
 
 def get_user_projects(owner_id: str) -> List[dict]:
     projects = _read("projects.json")
-    user_projects = [
-        p for p in projects.values() if p.get("owner_id") == owner_id
-    ]
+    user_projects = [p for p in projects.values() if p.get("owner_id") == owner_id]
     user_projects.sort(key=lambda p: p.get("created_at", ""), reverse=True)
     return user_projects
 
@@ -230,17 +269,14 @@ def delete_project(project_id: str) -> bool:
 # ── Usage tracking ────────────────────────────────────────────────────────────
 
 def _usage_month_key() -> str:
-    """Return current billing month key like '2026-09'."""
     now = datetime.utcnow()
     return f"{now.year}-{now.month:02d}"
 
 
 def record_usage(user_id: str, action: str, model: str, status: str,
                  credits_cost: int = 1, metadata: dict = None) -> dict:
-    """Record a single usage event for a user."""
     usage = _read("usage.json")
     month = _usage_month_key()
-
     if month not in usage:
         usage[month] = {}
     if user_id not in usage[month]:
@@ -260,7 +296,6 @@ def record_usage(user_id: str, action: str, model: str, status: str,
     usage[month][user_id]["total_credits"] += credits_cost
     _write("usage.json", usage)
 
-    # Also update user's credit balance
     users = _read("users.json")
     if user_id in users:
         _refresh_credits_if_needed(users[user_id])
@@ -277,15 +312,12 @@ def record_usage(user_id: str, action: str, model: str, status: str,
 
 
 def get_user_usage(user_id: str, months_back: int = 1) -> dict:
-    """Get aggregated usage for a user over recent months."""
     usage = _read("usage.json")
     result = {"months": {}}
-
-    for i in range(months_back):
+    for i in range(max(1, months_back)):
         dt = datetime.utcnow() - timedelta(days=30 * i)
         key = f"{dt.year}-{dt.month:02d}"
         month_data = usage.get(key, {}).get(user_id, {"total_credits": 0, "events": []})
-
         actions = {}
         for ev in month_data.get("events", []):
             act = ev.get("action", "unknown")
@@ -293,26 +325,22 @@ def get_user_usage(user_id: str, months_back: int = 1) -> dict:
                 actions[act] = {"count": 0, "credits": 0}
             actions[act]["count"] += 1
             actions[act]["credits"] += ev.get("credits_cost", 0)
-
         result["months"][key] = {
             "total_credits": month_data.get("total_credits", 0),
             "event_count": len(month_data.get("events", [])),
             "by_action": actions,
-            "events": month_data.get("events", [])[-50:],  # last 50 events
+            "events": month_data.get("events", [])[-50:],
         }
-
     return result
 
 
 def get_user_usage_summary(user_id: str) -> dict:
-    """Get a concise usage summary for dashboard display."""
     users = _read("users.json")
     user = users.get(user_id, {})
     plan = get_plan(user.get("plan", "free"))
     month = _usage_month_key()
     usage = _read("usage.json")
     month_data = usage.get(month, {}).get(user_id, {"total_credits": 0, "events": []})
-
     return {
         "plan": plan,
         "credits_remaining": user.get("credits_remaining", 0),
@@ -328,17 +356,11 @@ def _aggregate_actions(events: list) -> dict:
     actions = {}
     for ev in events:
         act = ev.get("action", "unknown")
-        if act not in actions:
-            actions[act] = 0
-        actions[act] += 1
+        actions[act] = actions.get(act, 0) + 1
     return actions
 
 
 def check_generation_limit(user_id: str, action_type: str, amount: int = 1) -> dict:
-    """
-    Check if a user can perform a generation action.
-    Returns { allowed: bool, reason: str, remaining: int }
-    """
     users = _read("users.json")
     user = users.get(user_id, {})
     if not user:
@@ -357,29 +379,24 @@ def check_generation_limit(user_id: str, action_type: str, amount: int = 1) -> d
             "remaining": credits,
         }
 
-    # Check plan-specific limits
     month = _usage_month_key()
     usage = _read("usage.json")
     month_data = usage.get(month, {}).get(user_id, {"events": []})
     events = month_data.get("events", [])
-
     limits = plan.get("limits", {})
 
-    # Check monthly event limits
     if action_type == "image":
         limit = limits.get("images_per_month", -1)
         if limit > 0:
             used = sum(1 for e in events if e.get("action") == "image" and e.get("status") == "ok")
             if used + amount > limit:
-                return {"allowed": False, "reason": f"Monthly image limit reached ({limit}). Upgrade to Creator for more.", "remaining": max(0, limit - used)}
-
+                return {"allowed": False, "reason": f"Monthly image limit reached ({limit}). Upgrade your plan for more.", "remaining": max(0, limit - used)}
     elif action_type == "video":
         limit = limits.get("videos_per_month", -1)
         if limit > 0:
             used = sum(1 for e in events if e.get("action") in ("video", "assemble") and e.get("status") == "ok")
             if used + amount > limit:
-                return {"allowed": False, "reason": f"Monthly video limit reached ({limit}). Upgrade to Creator for more.", "remaining": max(0, limit - used)}
-
+                return {"allowed": False, "reason": f"Monthly video limit reached ({limit}). Upgrade your plan for more.", "remaining": max(0, limit - used)}
     elif action_type == "voiceover":
         limit = limits.get("voiceover_minutes_per_month", -1)
         if limit > 0:
@@ -388,7 +405,7 @@ def check_generation_limit(user_id: str, action_type: str, amount: int = 1) -> d
                 for e in events
                 if e.get("action") == "voiceover" and e.get("status") == "ok"
             )
-            if used_minutes + (amount * 0.1) > limit:  # rough estimate
+            if used_minutes + (amount * 0.1) > limit:
                 return {"allowed": False, "reason": f"Monthly voiceover limit reached ({limit}min). Upgrade for more.", "remaining": max(0, int(limit - used_minutes))}
 
     return {"allowed": True, "reason": "", "remaining": credits - amount}
@@ -397,7 +414,6 @@ def check_generation_limit(user_id: str, action_type: str, amount: int = 1) -> d
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
 def update_plan_limits(plan_id: str, updates: dict) -> Optional[dict]:
-    """Admin: update limits for a plan."""
     plans = _read("plans.json")
     if plan_id not in plans.get("plans", {}):
         return None
@@ -407,11 +423,9 @@ def update_plan_limits(plan_id: str, updates: dict) -> Optional[dict]:
 
 
 def get_all_users_summary() -> List[dict]:
-    """Admin: get summary of all users."""
     users = _read("users.json")
     month = _usage_month_key()
     usage = _read("usage.json")
-
     summaries = []
     for uid, user in users.items():
         month_data = usage.get(month, {}).get(uid, {"total_credits": 0, "events": []})
