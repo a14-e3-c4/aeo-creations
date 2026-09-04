@@ -1,9 +1,8 @@
 """High-quality automatic image animation for AEO Creations.
 
-This layer keeps the existing generation providers intact while upgrading the
-single-image fallback into a polished cinematic motion renderer. It uses the
-exact generated image, high-resolution overscan, smooth easing, 30fps output,
-and high-quality H.264 encoding.
+Handles both JSON base64 images and the multipart upload format used by the
+Generate UI's manual Animate button. The exact supplied image is rendered into
+a polished 1080p/30fps cinematic MP4 without regenerating it.
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from starlette.requests import Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from backend.production import app as production_app
@@ -27,13 +27,7 @@ MAX_DURATION = 30.0
 
 
 def _render_cinematic_animation(image_bytes: bytes, output_path: Path, effect: str, duration: float) -> None:
-    """Render a high-quality 2D cinematic camera move with FFmpeg.
-
-    This is deliberately deterministic: unlike an AI video model it cannot
-    invent motion in the scene, but it produces much cleaner camera movement
-    than a basic Ken Burns implementation and is extremely reliable as an
-    automatic fallback.
-    """
+    """Render a polished 1080p cinematic camera move with FFmpeg."""
     from PIL import Image
     from backend.main import FFMPEG_PATH
 
@@ -48,10 +42,10 @@ def _render_cinematic_animation(image_bytes: bytes, output_path: Path, effect: s
     fps = 30
     width, height = 1920, 1080
 
-    # Work from a large source so the camera has real pixels to move through.
-    # 2.0x overscan gives substantially more headroom than the old 1.1x crop.
     with Image.open(io.BytesIO(image_bytes)) as src:
         src = src.convert("RGB")
+        # Large overscan preserves detail while giving the camera real pixels
+        # to travel through, avoiding the crude cropped look of basic zooms.
         scale = max(width / src.width, height / src.height) * 2.0
         sw = max(width * 2, int(src.width * scale))
         sh = max(height * 2, int(src.height * scale))
@@ -61,62 +55,54 @@ def _render_cinematic_animation(image_bytes: bytes, output_path: Path, effect: s
             src.save(tmp.name, "PNG", optimize=True)
             tmp.close()
 
-            # Motion is intentionally eased rather than linear. This creates
-            # the acceleration/deceleration of a real camera move.
+            frames_total = max(2, int(round(duration * fps)))
+            last = frames_total - 1
+            progress = f"on/{last}"
+
             if effect == "zoom-out":
-                zoom = "1.32-0.32*on/(max(1,ceil({fps}*{dur}))-1)".format(fps=fps, dur=duration)
+                zoom = f"1.32-0.32*({progress})"
                 x = "(iw-iw/zoom)/2"
                 y = "(ih-ih/zoom)/2"
             elif effect == "pan-left":
                 zoom = "1.12"
-                x = "(iw-iw/zoom)*(1-on/(max(1,ceil({fps}*{dur}))-1))".format(fps=fps, dur=duration)
-                y = "(ih-ih/zoom)*(0.46-0.08*on/(max(1,ceil({fps}*{dur}))-1))".format(fps=fps, dur=duration)
+                x = f"(iw-iw/zoom)*(1-{progress})"
+                y = f"(ih-ih/zoom)*(0.46-0.08*{progress})"
             elif effect == "pan-right":
                 zoom = "1.12"
-                x = "(iw-iw/zoom)*(on/(max(1,ceil({fps}*{dur}))-1))".format(fps=fps, dur=duration)
-                y = "(ih-ih/zoom)*(0.46-0.08*on/(max(1,ceil({fps}*{dur}))-1))".format(fps=fps, dur=duration)
+                x = f"(iw-iw/zoom)*({progress})"
+                y = f"(ih-ih/zoom)*(0.46-0.08*{progress})"
             elif effect in {"zoom-in-pan", "zoom-pan"}:
-                # Smooth push-in plus diagonal camera drift.
-                zoom = "1.04+0.18*pow(on/(max(1,ceil({fps}*{dur}))-1),2)".format(fps=fps, dur=duration)
-                x = "(iw-iw/zoom)*(0.30+0.40*on/(max(1,ceil({fps}*{dur}))-1))"
-                y = "(ih-ih/zoom)*(0.34+0.22*on/(max(1,ceil({fps}*{dur}))-1))"
+                zoom = f"1.04+0.18*pow({progress},2)"
+                x = f"(iw-iw/zoom)*(0.30+0.40*{progress})"
+                y = f"(ih-ih/zoom)*(0.34+0.22*{progress})"
             elif effect == "dolly":
-                zoom = "1.03+0.22*(1-pow(1-on/(max(1,ceil({fps}*{dur}))-1),2))".format(fps=fps, dur=duration)
-                x = "(iw-iw/zoom)*(0.50+0.04*sin(on/({fps}*{dur})*PI))".format(fps=fps, dur=duration)
-                y = "(ih-ih/zoom)*(0.48-0.05*sin(on/({fps}*{dur})*PI))".format(fps=fps, dur=duration)
+                zoom = f"1.03+0.22*(1-pow(1-{progress},2))"
+                x = f"(iw-iw/zoom)*(0.50+0.04*sin(on/({fps}*{duration})*PI))"
+                y = f"(ih-ih/zoom)*(0.48-0.05*sin(on/({fps}*{duration})*PI))"
             else:
-                # Premium default push-in with a tiny organic drift.
-                zoom = "1.03+0.19*pow(on/(max(1,ceil({fps}*{dur}))-1),1.55)".format(fps=fps, dur=duration)
-                x = "(iw-iw/zoom)*(0.48+0.04*sin(on/({fps}*{dur})*PI))".format(fps=fps, dur=duration)
-                y = "(ih-ih/zoom)*(0.46-0.035*sin(on/({fps}*{dur})*PI))".format(fps=fps, dur=duration)
+                zoom = f"1.03+0.19*pow({progress},1.55)"
+                x = f"(iw-iw/zoom)*(0.48+0.04*sin(on/({fps}*{duration})*PI))"
+                y = f"(ih-ih/zoom)*(0.46-0.035*sin(on/({fps}*{duration})*PI))"
 
-            frames = int(round(duration * fps))
             fade = min(0.22, duration / 8)
-            fade_out_start = max(0, duration - fade)
-
+            fade_out_start = max(0.0, duration - fade)
             vf = (
-                f"zoompan=z='{zoom}':x='{x}':y='{y}':"
-                f"d=1:s={width}x{height}:fps={fps},"
-                f"eq=contrast=1.025:saturation=1.035:brightness=0.002,"
-                f"unsharp=5:5:0.35:5:5:0.0,"
+                f"zoompan=z='{zoom}':x='{x}':y='{y}':d=1:s={width}x{height}:fps={fps},"
+                "eq=contrast=1.025:saturation=1.035:brightness=0.002,"
+                "unsharp=5:5:0.35:5:5:0.0,"
                 f"fade=t=in:st=0:d={fade:.3f},"
                 f"fade=t=out:st={fade_out_start:.3f}:d={fade:.3f},"
-                f"format=yuv420p"
+                "format=yuv420p"
             )
 
             cmd = [
                 FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
                 "-loop", "1", "-i", tmp.name,
                 "-vf", vf,
-                "-frames:v", str(frames),
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "17",
-                "-profile:v", "high",
-                "-level", "4.1",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                str(output_path),
+                "-frames:v", str(frames_total),
+                "-c:v", "libx264", "-preset", "medium", "-crf", "17",
+                "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", str(output_path),
             ]
             subprocess.run(cmd, check=True, timeout=max(120, int(duration * 30)))
         finally:
@@ -126,8 +112,29 @@ def _render_cinematic_animation(image_bytes: bytes, output_path: Path, effect: s
                 pass
 
 
+def _image_response(image_b64: str, image_bytes: bytes, effect: str, duration: float):
+    """Render and return a standard animation response."""
+    from PIL import Image
+    from backend.main import OUTPUT_DIR
+
+    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("Invalid image size")
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.verify()
+
+    allowed = {"zoom-in", "zoom-out", "pan-left", "pan-right", "zoom-in-pan", "zoom-pan", "dolly"}
+    if effect not in allowed:
+        effect = "zoom-in"
+    duration = max(1.0, min(float(duration or 5), MAX_DURATION))
+
+    video_name = f"auto_cinematic_{uuid.uuid4().hex[:12]}.mp4"
+    video_path = OUTPUT_DIR / video_name
+    asyncio_result = (image_bytes, video_path, effect, duration)
+    return asyncio_result
+
+
 class ExactImageAnimationMiddleware:
-    """Automatically animate the exact generated image supplied by the UI."""
+    """Animate JSON and multipart images sent to the legacy /api/generate path."""
 
     def __init__(self, app_: ASGIApp):
         self.app = app_
@@ -150,71 +157,74 @@ class ExactImageAnimationMiddleware:
             if not message.get("more_body", False):
                 break
 
+        raw_body = bytes(body)
+        content_type = ""
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"content-type":
+                content_type = value.decode("latin-1")
+                break
+
         async def replay_receive():
-            return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+
+        image_b64 = None
+        effect = "zoom-in"
+        duration = 5.0
+        image_bytes = None
 
         try:
-            payload = json.loads(bytes(body).decode("utf-8"))
-        except Exception:
-            await self.app(scope, replay_receive, send)
-            return
+            if content_type.startswith("application/json"):
+                payload = json.loads(raw_body.decode("utf-8"))
+                image_b64 = payload.get("image_b64")
+                effect = str(payload.get("kb_effect") or payload.get("effect") or "zoom-in")
+                duration = float(payload.get("kb_duration") or payload.get("duration") or 5)
+                if image_b64:
+                    raw = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
+                    image_bytes = base64.b64decode(raw, validate=True)
+            elif content_type.startswith("multipart/form-data"):
+                # This is the exact format emitted by GenerateTab.animateImage().
+                request = Request(scope, replay_receive)
+                form = await request.form()
+                upload = form.get("file")
+                if upload is not None and hasattr(upload, "read"):
+                    image_bytes = await upload.read()
+                    effect = str(form.get("effect") or "zoom-in")
+                    duration = float(form.get("duration") or 5)
+                    image_b64 = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+            else:
+                await self.app(scope, replay_receive, send)
+                return
 
-        image_b64 = payload.get("image_b64")
-        if not image_b64:
-            await self.app(scope, replay_receive, send)
-            return
+            if not image_bytes:
+                await self.app(scope, replay_receive, send)
+                return
 
-        try:
-            raw = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
-            image_bytes = base64.b64decode(raw, validate=True)
-            if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
-                raise ValueError("Invalid image size")
-
-            from PIL import Image
-            with Image.open(io.BytesIO(image_bytes)) as image:
-                image.verify()
-
-            effect = str(payload.get("kb_effect") or "zoom-in")
-            duration = float(payload.get("kb_duration") or 5)
-            duration = max(1.0, min(duration, MAX_DURATION))
-
-            from backend.main import OUTPUT_DIR
-            video_name = f"auto_cinematic_{uuid.uuid4().hex[:12]}.mp4"
-            video_path = OUTPUT_DIR / video_name
-
-            await asyncio.to_thread(
-                _render_cinematic_animation,
-                image_bytes,
-                video_path,
-                effect,
-                duration,
+            image_bytes, video_path, effect, duration = _image_response(
+                image_b64 or "", image_bytes, effect, duration
             )
-
+            await asyncio.to_thread(
+                _render_cinematic_animation, image_bytes, video_path, effect, duration
+            )
             if not video_path.exists() or video_path.stat().st_size == 0:
                 raise RuntimeError("Animation output was not created")
 
-            url = f"/api/file/{video_name}"
+            url = f"/api/file/{video_path.name}"
             response = {
-                "status": "ok",
-                "cached": False,
-                "file": url,
-                "video": url,
-                "video_url": url,
+                "status": "ok", "cached": False,
+                "file": url, "video": url, "video_url": url,
                 "image": image_b64,
+                "effect": effect, "duration": duration,
                 "message": f"Cinematic animation complete ({effect}, 30fps, 1080p).",
             }
             data = json.dumps(response).encode("utf-8")
             await send({
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(data)).encode("ascii")),
-                ],
+                "type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"application/json"),
+                             (b"content-length", str(len(data)).encode("ascii"))],
             })
             await send({"type": "http.response.body", "body": data})
         except Exception:
-            # Never let the animation upgrade break normal generation.
+            # Preserve the original endpoint if the compatibility animation cannot run.
             await self.app(scope, replay_receive, send)
 
 
