@@ -1,0 +1,100 @@
+{
+  "plans": {
+    "free": {
+      "id": "free",
+      "name": "Free",
+      "price_monthly": 0,
+      "price_yearly": 0,
+      "credits_per_month": 50,
+      "max_scenes_per_video": 5,
+      "max_duration_seconds": 30,
+      "voiceover_enabled": true,
+      "caption_styles": ["clean", "minimal"],
+      "export_quality": "720p",
+      "watermark": true,
+      "priority_queue": false,
+      "api_access": false,
+      "custom_branding": false,
+      "features": [
+        "50 credits per month",
+        "AI scripts and hooks",
+        "AI images",
+        "Ken Burns video creation",
+        "Basic voiceover and captions",
+        "720p exports with watermark"
+      ],
+      "limits": {
+        "images_per_month": 40,
+        "videos_per_month": 10,
+        "voiceover_minutes_per_month": 10,
+        "storage_mb": 500,
+        "projects": 3
+      }
+    },
+    "creator": {
+      "id": "creator",
+      "name": "Creator",
+      "price_monthly": 9,
+      "price_yearly": 90,
+      "credits_per_month": 500,
+      "max_scenes_per_video": 12,
+      "max_duration_seconds": 120,
+      "voiceover_enabled": true,
+      "caption_styles": ["clean", "bold", "highlight", "minimal"],
+      "export_quality": "1080p",
+      "watermark": false,
+      "priority_queue": true,
+      "api_access": false,
+      "custom_branding": true,
+      "features": [
+        "500 credits per month",
+        "1080p exports",
+        "No watermark",
+        "All caption styles",
+        "Priority generation",
+        "Custom branding",
+        "Longer videos and more scenes"
+      ],
+      "limits": {
+        "images_per_month": 400,
+        "videos_per_month": 100,
+        "voiceover_minutes_per_month": 120,
+        "storage_mb": 5000,
+        "projects": 25
+      }
+    },
+    "pro": {
+      "id": "pro",
+      "name": "Pro",
+      "price_monthly": 24,
+      "price_yearly": 240,
+      "credits_per_month": 2000,
+      "max_scenes_per_video": 30,
+      "max_duration_seconds": 600,
+      "voiceover_enabled": true,
+      "caption_styles": ["clean", "bold", "highlight", "minimal"],
+      "export_quality": "4K",
+      "watermark": false,
+      "priority_queue": true,
+      "api_access": true,
+      "custom_branding": true,
+      "features": [
+        "2,000 credits per month",
+        "4K exports",
+        "No watermark",
+        "All caption styles",
+        "Highest priority generation",
+        "Custom branding",
+        "API access",
+        "Up to 10-minute videos"
+      ],
+      "limits": {
+        "images_per_month": 2000,
+        "videos_per_month": 500,
+        "voiceover_minutes_per_month": 600,
+        "storage_mb": 25000,
+        "projects": 100
+      }
+    }
+  }
+}
