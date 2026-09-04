@@ -2629,6 +2629,364 @@ def clear_cache():
     return {"cleared": count}
 
 
+# =============================================================================
+# CREATE VIDEO WORKFLOW — Production-quality short-form content studio
+# =============================================================================
+
+# Store workflow state in memory (job_id -> data)
+create_video_jobs = {}
+
+
+class CreateVideoHookRequest(BaseModel):
+    """Step 6: Generate AI hook from topic/platform/content_type."""
+    topic: str = Field(..., min_length=3, max_length=500)
+    platform: str = Field(default="youtube-shorts")
+    content_type: str = Field(default="educational")
+    visual_style: str = Field(default="cinematic")
+
+
+class CreateVideoScriptRequest(BaseModel):
+    """Step 7: Generate structured script from hook + settings."""
+    topic: str
+    platform: str
+    duration: int
+    content_type: str
+    visual_style: str
+    hook: str
+
+
+class CreateVideoScenesRequest(BaseModel):
+    """Step 8-9: Generate scene list with visual prompts."""
+    topic: str
+    platform: str
+    duration: int
+    content_type: str
+    visual_style: str
+    hook: str
+    script: str
+
+
+class CreateVideoSceneImageRequest(BaseModel):
+    """Step 10: Generate image for a single scene."""
+    scene_index: int
+    visual_prompt: str
+    style: str = "cinematic"
+    width: int = 1024
+    height: int = 576
+
+
+class CreateVideoAssembleRequest(BaseModel):
+    """Step 11: Assemble all scene images into final video."""
+    job_id: str
+    scene_images: List[str]  # base64 encoded images
+    scene_durations: List[float]
+    scene_voiceovers: List[str]
+    scene_captions: List[str]
+    platform: str = "youtube-shorts"
+    title: str = "Generated Video"
+
+
+PLATFORM_SPECS = {
+    "tiktok": {"width": 1080, "height": 1920, "ratio": "9:16", "max_duration": 180},
+    "youtube-shorts": {"width": 1080, "height": 1920, "ratio": "9:16", "max_duration": 60},
+    "instagram-reels": {"width": 1080, "height": 1920, "ratio": "9:16", "max_duration": 90},
+    "youtube": {"width": 1920, "height": 1080, "ratio": "16:9", "max_duration": 600},
+    "facebook": {"width": 1280, "height": 720, "ratio": "16:9", "max_duration": 240},
+}
+
+CONTENT_TYPE_PROMPTS = {
+    "educational": "Use clear, step-by-step visuals. Include diagrams, infographics, and explanatory shots. Narration should be informative and easy to follow.",
+    "storytelling": "Create dramatic, emotional scenes. Use cinematic lighting, character close-ups, and atmospheric shots. Build tension and narrative arc.",
+    "advertisement": "Make it bold, attention-grabbing, and product-focused. Use vibrant colors, close-up product shots, and energetic transitions. Include a clear call-to-action.",
+    "product-promo": "Showcase the product from multiple angles. Use clean backgrounds, highlight features, and create desire through premium aesthetics.",
+    "faceless-video": "Use abstract visuals, b-roll footage style imagery, text overlays, and atmospheric scenes. No people needed — focus on mood and message.",
+    "documentary": "Use real-world style footage, interviews, landscape shots, and historical imagery. Informative, authentic, and compelling.",
+    "motivational": "Use inspiring landscapes, sunrise/sunset imagery, people achieving goals, and uplifting visuals. Build emotional momentum.",
+}
+
+
+@app.post("/api/create-video/generate-hook")
+async def create_video_generate_hook(body: CreateVideoHookRequest):
+    """Step 6: Generate an engaging hook for the video."""
+    if not groq_client:
+        raise HTTPException(400, "Groq API not configured")
+
+    prompt = f"""
+You are a viral content creator. Generate a compelling hook for a {body.content_type} video.
+
+Topic: {body.topic}
+Platform: {body.platform}
+Visual Style: {body.visual_style}
+
+The hook should:
+- Grab attention in the first 1-3 seconds
+- Be optimized for {body.platform} audience
+- Create curiosity or emotional response
+- Be 1-2 sentences maximum
+- Work as both text overlay and voiceover opener
+
+Return ONLY the hook text, no quotes, no explanation.
+"""
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {"role": "system", "content": "You are a viral content creator. Return only the hook text."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.9,
+            max_tokens=200,
+        )
+        hook = response.choices[0].message.content.strip()
+        # Clean up any quotes or extra formatting
+        hook = hook.strip('"').strip("'").strip('"')
+        record_call("create-video-hook", "ok")
+        return {"status": "ok", "hook": hook, "message": "Hook generated successfully"}
+    except Exception as e:
+        record_call("create-video-hook", "error")
+        raise HTTPException(500, f"Hook generation failed: {str(e)[:200]}")
+
+
+@app.post("/api/create-video/generate-script")
+async def create_video_generate_script(body: CreateVideoScriptRequest):
+    """Step 7: Generate structured script with scenes and voiceover."""
+    if not groq_client:
+        raise HTTPException(400, "Groq API not configured")
+
+    content_guide = CONTENT_TYPE_PROMPTS.get(body.content_type, "Create engaging visuals.")
+    plat_spec = PLATFORM_SPECS.get(body.platform, PLATFORM_SPECS["youtube-shorts"])
+
+    prompt = f"""
+You are a professional video scriptwriter for {body.platform} content.
+
+Generate a complete video script for:
+- Topic: {body.topic}
+- Platform: {body.platform} ({plat_spec['ratio']}, max {body.duration}s)
+- Content Type: {body.content_type}
+- Visual Style: {body.visual_style}
+- Hook: {body.hook}
+
+Content Guidelines: {content_guide}
+
+Return a JSON object with this EXACT structure (no markdown, just raw JSON):
+{{
+  "title": "Compelling video title",
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "duration": 5,
+      "visual_prompt": "Detailed AI image generation prompt for this scene - cinematic, {body.visual_style}, highly detailed, 4K quality",
+      "voiceover": "What the narrator says in this scene",
+      "caption": "Short on-screen text overlay"
+    }}
+  ]
+}}
+
+Rules:
+- Each scene: 3-10 seconds
+- Total duration ≈ {body.duration} seconds
+- Visual prompts must be detailed enough for AI image generation
+- Voiceover must be natural and engaging
+- Captions are short, punchy, max 8 words
+- Return ONLY the JSON
+"""
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {"role": "system", "content": "You are a professional video scriptwriter. Always return valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2500,
+        )
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+
+        script_data = json.loads(content)
+        title = script_data.get("title", body.topic)
+        scenes = script_data.get("scenes", [])
+
+        if not scenes:
+            raise HTTPException(500, "AI returned empty scenes")
+
+        full_script = f"# {title}\n\n"
+        full_script += f"**Hook:** {body.hook}\n\n"
+        for s in scenes:
+            full_script += f"## Scene {s.get('scene_number', '?')} ({s.get('duration', '?')}s)\n"
+            full_script += f"**Visual:** {s.get('visual_prompt', '')}\n"
+            full_script += f"**Voiceover:** {s.get('voiceover', '')}\n"
+            full_script += f"**Caption:** {s.get('caption', '')}\n\n"
+
+        record_call("create-video-script", "ok")
+        return {
+            "status": "ok",
+            "title": title,
+            "scenes": scenes,
+            "full_script": full_script,
+            "message": f"Script generated: {len(scenes)} scenes, ~{sum(s.get('duration', 5) for s in scenes)}s total",
+        }
+    except json.JSONDecodeError as e:
+        record_call("create-video-script", "error")
+        raise HTTPException(500, f"AI returned invalid JSON: {str(e)[:100]}")
+    except Exception as e:
+        record_call("create-video-script", "error")
+        raise HTTPException(500, f"Script generation failed: {str(e)[:200]}")
+
+
+@app.post("/api/create-video/generate-scene-image")
+async def create_video_generate_scene_image(body: CreateVideoSceneImageRequest):
+    """Step 10: Generate image for a single scene using Pollinations.ai."""
+    import urllib.parse
+    prompt = body.visual_prompt
+    if body.style and body.style not in prompt.lower():
+        prompt = f"{prompt}, {body.style} style, cinematic lighting, highly detailed"
+
+    seed = int(time.time() * 1000) % 100000 + body.scene_index
+    encoded = urllib.parse.quote(prompt)
+
+    # Use Pollinations.ai — free, no key needed, good quality
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width={body.width}&height={body.height}&seed={seed}&nologo=true&enhance=true"
+
+    try:
+        resp = http_requests.get(url, timeout=90, stream=True)
+        if resp.status_code != 200:
+            raise HTTPException(500, f"Image generation failed: HTTP {resp.status_code}")
+
+        img_data = resp.content
+        if len(img_data) < 1000:
+            raise HTTPException(500, "Image too small — generation failed")
+
+        b64 = base64.b64encode(img_data).decode()
+
+        # Save to output dir
+        fname = f"scene_{body.scene_index}_{int(time.time())}.png"
+        out_path = OUTPUT_DIR / fname
+        out_path.write_bytes(img_data)
+
+        record_call("create-video-scene-image", "ok")
+        return {
+            "status": "ok",
+            "image_b64": b64,
+            "filename": fname,
+            "url": f"/api/file/{fname}",
+            "message": f"Scene {body.scene_index} image generated",
+        }
+    except http_requests.exceptions.Timeout:
+        record_call("create-video-scene-image", "error")
+        raise HTTPException(504, "Image generation timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        record_call("create-video-scene-image", "error")
+        raise HTTPException(500, f"Image generation failed: {str(e)[:200]}")
+
+
+@app.post("/api/create-video/assemble")
+async def create_video_assemble(body: CreateVideoAssembleRequest):
+    """Step 11: Assemble scene images + voiceovers into a final MP4 video."""
+    if not MOVIEPY_AVAILABLE:
+        raise HTTPException(500, "moviepy not available — cannot assemble video")
+
+    from moviepy import vfx as _vfx
+
+    plat_spec = PLATFORM_SPECS.get(body.platform, PLATFORM_SPECS["youtube-shorts"])
+    width = plat_spec["width"]
+    height = plat_spec["height"]
+
+    try:
+        clips = []
+        for i, (img_b64, dur, voiceover, caption) in enumerate(
+            zip(body.scene_images, body.scene_durations, body.scene_voiceovers, body.scene_captions)
+        ):
+            # Decode image
+            img_bytes = base64.b64decode(img_b64)
+            img = Image.open(io.BytesIO(img_bytes))
+
+            # Resize to target dimensions
+            img = img.resize((width, height), Image.LANCZOS)
+
+            # Save temp image
+            tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            img.save(tmp_img.name, "PNG")
+
+            # Create video clip from image
+            clip = ImageClip(tmp_img.name, duration=dur)
+            clip = clip.with_effects([_vfx.CrossFadeIn(0.5)])
+            clips.append(clip)
+
+        # Concatenate all clips with crossfade
+        if len(clips) > 1:
+            final = concatenate_videoclips(clips, method="compose", padding=-0.5)
+        else:
+            final = clips[0]
+
+        # Output file
+        job_filename = f"final_{body.job_id}.mp4"
+        output_path = OUTPUT_DIR / job_filename
+
+        final.write_videofile(
+            str(output_path),
+            fps=24,
+            codec="libx264",
+            audio=False,
+            preset="fast",
+            threads=4,
+            logger=None,
+        )
+
+        # Cleanup temp files
+        for clip in clips:
+            try:
+                os.unlink(clip.filename)
+            except Exception:
+                pass
+
+        record_call("create-video-assemble", "ok")
+        return {
+            "status": "ok",
+            "video_url": f"/api/file/{job_filename}",
+            "filename": job_filename,
+            "duration": sum(body.scene_durations),
+            "message": f"Video assembled: {len(clips)} scenes, {sum(body.scene_durations):.1f}s",
+        }
+    except Exception as e:
+        record_call("create-video-assemble", "error")
+        raise HTTPException(500, f"Video assembly failed: {str(e)[:200]}")
+
+
+@app.get("/api/create-video/platforms")
+async def create_video_platforms():
+    """Return available platforms and their specs."""
+    visual_styles = [
+        {"id": "cinematic", "label": "Cinematic", "hint": "Film-quality lighting"},
+        {"id": "photorealistic", "label": "Photorealistic", "hint": "Ultra-real photos"},
+        {"id": "anime", "label": "Anime", "hint": "Japanese animation"},
+        {"id": "3d render", "label": "3D Render", "hint": "CGI quality"},
+        {"id": "digital art", "label": "Digital Art", "hint": "Illustration style"},
+        {"id": "oil painting", "label": "Oil Painting", "hint": "Classical artwork"},
+        {"id": "watercolor", "label": "Watercolor", "hint": "Soft painted look"},
+        {"id": "pixel art", "label": "Pixel Art", "hint": "Retro game style"},
+    ]
+    return {
+        "platforms": [
+            {"id": k, "label": k.replace("-", " ").title(), **v}
+            for k, v in PLATFORM_SPECS.items()
+        ],
+        "content_types": [
+            {"id": k, "label": k.replace("-", " ").title()}
+            for k in CONTENT_TYPE_PROMPTS.keys()
+        ],
+        "visual_styles": visual_styles,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting AI Video Generator on port 8000...")

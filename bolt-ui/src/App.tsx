@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import {
   Clapperboard, Film, Image as ImageIcon, Scissors, Video,
-  Upload, Trash2, Sparkles, X,
+  Upload, Trash2, Sparkles, X, Wand2,
 } from 'lucide-react';
 import type { Generation, LibraryItem, UsageEntry } from '@/lib/types';
 import { Sidebar } from '@/components/Sidebar';
@@ -10,12 +10,14 @@ import { AIVideoTab } from '@/components/tabs/AIVideoTab';
 import { GenerateTab } from '@/components/tabs/GenerateTab';
 import { EditTab } from '@/components/tabs/EditTab';
 import { VideoTab } from '@/components/tabs/VideoTab';
+import { CreateVideoTab } from '@/components/tabs/CreateVideoTab';
 import { UploadModal } from '@/components/UploadModal';
 import { Lightbox } from '@/components/Lightbox';
 
-export type TabName = 'script' | 'aivideo' | 'generate' | 'edit' | 'video';
+export type TabName = 'create' | 'script' | 'aivideo' | 'generate' | 'edit' | 'video';
 
 const TABS: { id: TabName; label: string; icon: typeof Film }[] = [
+  { id: 'create', label: 'Create Video', icon: Wand2 },
   { id: 'script', label: 'Script', icon: Sparkles },
   { id: 'aivideo', label: 'AI Video', icon: Clapperboard },
   { id: 'generate', label: 'Image', icon: ImageIcon },
@@ -160,6 +162,7 @@ export default function App() {
 
         <main className="flex-1 overflow-y-auto p-6 lg:p-7">
           <div key={activeTab} className="animate-slide-up">
+            {activeTab === 'create' && <CreateVideoTab onRecordUsage={recordUsage} />}
             {activeTab === 'script' && <ScriptTab onUsePrompt={usePromptForGeneration} onRecordUsage={recordUsage} />}
             {activeTab === 'aivideo' && <AIVideoTab onRecordUsage={recordUsage} onSaveGeneration={saveGeneration} />}
             {activeTab === 'generate' && (
