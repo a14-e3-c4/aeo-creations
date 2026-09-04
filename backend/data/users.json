@@ -1,0 +1,34 @@
+{
+  "f220019a8f17194ffa984ea16fb8155a": {
+    "id": "f220019a8f17194ffa984ea16fb8155a",
+    "email": "test@aeo.com",
+    "password_hash": "d4ea0bdc4c123fd3de63c825b16faaee:a7d9884b9b3988c63494962ba6b64e5b9823c8c2adf9480af1a71f6baa53891d",
+    "display_name": "Test User",
+    "avatar_url": null,
+    "plan": "free",
+    "credits_remaining": 50,
+    "credits_used_this_month": 0,
+    "billing_cycle_start": "2026-09-04T11:55:33.397285",
+    "created_at": "2026-09-04T11:55:33.397285",
+    "last_login": "2026-09-04T11:56:45.673347",
+    "is_admin": false,
+    "is_active": true,
+    "mock_checkout_completed": false
+  },
+  "98ca2a666a861a0d344c5ff634f67f4a": {
+    "id": "98ca2a666a861a0d344c5ff634f67f4a",
+    "email": "demo@aeo.creations",
+    "password_hash": "42a40cbe15b35167d434cdc911ddad5b:378a4a50e2045a35fb4bdae1057b1768284068e74cc4c2a86f18b7b2a3fb60df",
+    "display_name": "Demo User",
+    "avatar_url": null,
+    "plan": "free",
+    "credits_remaining": 50,
+    "credits_used_this_month": 0,
+    "billing_cycle_start": "2026-09-04T12:15:42.046617",
+    "created_at": "2026-09-04T12:15:42.046617",
+    "last_login": "2026-09-04T12:15:42.046617",
+    "is_admin": false,
+    "is_active": true,
+    "mock_checkout_completed": false
+  }
+}

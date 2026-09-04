@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 import requests as http_requests
 from huggingface_hub import InferenceClient
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -903,11 +903,6 @@ def api_status():
         "models": list(MODELS.keys()),
         "ai_video_models": MAGIC_HOUR_MODELS,
     }
-
-
-@app.get("/api/usage")
-def get_usage():
-    return usage_summary()
 
 
 @app.get("/api/prompt-tips")
@@ -3419,6 +3414,267 @@ async def caption_styles():
             {"id": "minimal", "label": "Minimal", "desc": "Subtle gray, thin outline, understated", "icon": "–"},
         ],
     }
+
+
+# =============================================================================
+# AUTH, PLANS, PROJECTS & USAGE — Monetization architecture
+# =============================================================================
+
+import store
+import hmac
+import hashlib as _hashlib
+
+# Simple token-based auth (JWT-like, HMAC-signed)
+AUTH_SECRET = os.getenv("AUTH_SECRET", secrets.token_hex(32))
+
+
+def _sign_token(payload: dict) -> str:
+    """Create a signed token (HMAC-SHA256)."""
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode()).decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac.new(AUTH_SECRET.encode(), f"{header}.{body}".encode(), _hashlib.sha256).digest()
+    signature = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return f"{header}.{body}.{signature}"
+
+
+def _verify_token(token: str) -> Optional[dict]:
+    """Verify and decode a signed token."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        header, body, sig = parts
+        expected_sig = hmac.new(AUTH_SECRET.encode(), f"{header}.{body}".encode(), _hashlib.sha256).digest()
+        actual_sig = base64.urlsafe_b64decode(sig + "==")
+        if not hmac.compare_digest(expected_sig, actual_sig):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(body + "=="))
+        # Check expiry
+        if payload.get("exp", 0) < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _get_current_user(request) -> Optional[dict]:
+    """Extract current user from Authorization header."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:]
+    payload = _verify_token(token)
+    if not payload:
+        return None
+    return store.get_user(payload.get("user_id"))
+
+
+def _require_user(request) -> dict:
+    """Require authenticated user or raise 401."""
+    user = _get_current_user(request)
+    if not user:
+        raise HTTPException(401, "Authentication required")
+    return user
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str = Field(..., min_length=6)
+    display_name: str = ""
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def _make_token(user: dict) -> str:
+    return _sign_token({
+        "user_id": user["id"],
+        "email": user["email"],
+        "plan": user.get("plan", "free"),
+        "exp": int(time.time()) + 86400 * 7,  # 7 days
+    })
+
+
+@app.post("/api/auth/register")
+async def auth_register(body: RegisterRequest):
+    try:
+        user = store.create_user(body.email, body.password, body.display_name)
+        token = _make_token(user)
+        return {"status": "ok", "user": user, "token": token}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Registration failed: {str(e)[:100]}")
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginRequest):
+    user = store.authenticate_user(body.email, body.password)
+    if not user:
+        raise HTTPException(401, "Invalid email or password")
+    token = _make_token(user)
+    return {"status": "ok", "user": user, "token": token}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    user = _get_current_user(request)
+    if not user:
+        raise HTTPException(401, "Not authenticated")
+    return {"status": "ok", "user": user}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout():
+    return {"status": "ok", "message": "Logged out"}
+
+
+@app.put("/api/auth/profile")
+async def auth_update_profile(request: Request, display_name: str = ""):
+    user = _require_user(request)
+    updates = {}
+    if display_name:
+        updates["display_name"] = display_name
+    updated = store.update_user(user["id"], updates)
+    return {"status": "ok", "user": updated}
+
+
+# ── Plans endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/api/plans")
+async def list_plans():
+    plans = store.get_plans()
+    return {"status": "ok", "plans": plans}
+
+
+@app.post("/api/plans/upgrade")
+async def plan_upgrade(request: Request, plan_id: str = ""):
+    """Mock upgrade — sets the plan without charging."""
+    user = _require_user(request)
+    if plan_id not in store.plan_ids():
+        raise HTTPException(400, f"Invalid plan: {plan_id}")
+    updated = store.set_user_plan(user["id"], plan_id)
+    return {"status": "ok", "user": updated, "message": f"Upgraded to {plan_id} (mock — no charge)"}
+
+
+@app.post("/api/plans/mock-checkout")
+async def plan_mock_checkout(request: Request, plan_id: str = ""):
+    """Simulate a successful checkout flow."""
+    user = _require_user(request)
+    if plan_id not in store.plan_ids():
+        raise HTTPException(400, f"Invalid plan: {plan_id}")
+    updated = store.set_user_plan(user["id"], plan_id)
+    store.update_user(user["id"], {"mock_checkout_completed": True})
+    return {
+        "status": "ok",
+        "user": updated,
+        "message": f"Mock checkout complete — you're now on {plan_id}!",
+        "checkout_id": secrets.token_hex(8),
+    }
+
+
+# ── Projects endpoints ────────────────────────────────────────────────────────
+
+@app.get("/api/projects")
+async def list_projects(request: Request):
+    user = _require_user(request)
+    projects = store.get_user_projects(user["id"])
+    return {"status": "ok", "projects": projects}
+
+
+@app.post("/api/projects")
+async def create_project(request: Request, title: str = "Untitled", topic: str = "", platform: str = ""):
+    user = _require_user(request)
+    # Check project limit
+    plan = store.get_plan(user.get("plan", "free"))
+    limit = plan.get("limits", {}).get("projects", 3) if plan else 3
+    existing = store.get_user_projects(user["id"])
+    if limit > 0 and len(existing) >= limit:
+        raise HTTPException(400, f"Project limit reached ({limit}). Upgrade your plan.")
+    project = store.create_project(user["id"], title, topic, platform)
+    return {"status": "ok", "project": project}
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str, request: Request):
+    user = _require_user(request)
+    project = store.get_project(project_id)
+    if not project or project.get("owner_id") != user["id"]:
+        raise HTTPException(404, "Project not found")
+    return {"status": "ok", "project": project}
+
+
+@app.put("/api/projects/{project_id}")
+async def update_project(project_id: str, request: Request, title: str = None, status: str = None):
+    user = _require_user(request)
+    project = store.get_project(project_id)
+    if not project or project.get("owner_id") != user["id"]:
+        raise HTTPException(404, "Project not found")
+    updates = {}
+    if title is not None:
+        updates["title"] = title
+    if status is not None:
+        updates["status"] = status
+    updated = store.update_project(project_id, updates)
+    return {"status": "ok", "project": updated}
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, request: Request):
+    user = _require_user(request)
+    project = store.get_project(project_id)
+    if not project or project.get("owner_id") != user["id"]:
+        raise HTTPException(404, "Project not found")
+    store.delete_project(project_id)
+    return {"status": "ok", "message": "Project deleted"}
+
+
+# ── Usage endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/api/usage")
+async def get_usage(request: Request, months: int = 1):
+    user = _require_user(request)
+    usage = store.get_user_usage(user["id"], months_back=months)
+    summary = store.get_user_usage_summary(user["id"])
+    return {"status": "ok", "usage": usage, "summary": summary}
+
+
+@app.get("/api/usage/check")
+async def check_usage_limit(request: Request, action: str = "image", amount: int = 1):
+    """Check if user can perform an action."""
+    user = _require_user(request)
+    check = store.check_generation_limit(user["id"], action, amount)
+    plan = store.get_plan(user.get("plan", "free"))
+    return {
+        "status": "ok",
+        **check,
+        "plan": user.get("plan", "free"),
+        "plan_info": plan,
+    }
+
+
+# ── Admin endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/api/admin/users")
+async def admin_list_users(request: Request):
+    user = _require_user(request)
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    return {"status": "ok", "users": store.get_all_users_summary()}
+
+
+@app.put("/api/admin/plans/{plan_id}")
+async def admin_update_plan(plan_id: str, request: Request, updates: dict = {}):
+    user = _require_user(request)
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    result = store.update_plan_limits(plan_id, updates)
+    if not result:
+        raise HTTPException(404, f"Plan {plan_id} not found")
+    return {"status": "ok", "plan": result}
 
 
 if __name__ == "__main__":
