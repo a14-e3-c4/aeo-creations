@@ -81,9 +81,6 @@ PIXVERSE_API_KEY = os.getenv("PIXVERSE_API_KEY", "").strip()
 JSON2VIDEO_API_KEY = os.getenv("JSON2VIDEO_API_KEY", "").strip()
 REWIND_API_KEY = os.getenv("REWIND_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-MODAL_TOKEN_ID = os.getenv("MODAL_TOKEN_ID", "").strip()
-MODAL_TOKEN_SECRET = os.getenv("MODAL_TOKEN_SECRET", "").strip()
 CACHE_DIR = ROOT / "cache"
 OUTPUT_DIR = ROOT / "output"
 UPLOAD_DIR = ROOT / "uploads"
@@ -117,35 +114,6 @@ MODELS = {
 }
 
 hf_client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else None
-
-# Modal cloud GPU for premium FLUX.1-dev image generation
-MODAL_AVAILABLE = False
-try:
-    if MODAL_TOKEN_ID and MODAL_TOKEN_SECRET:
-        import modal as _modal
-        os.environ["MODAL_TOKEN_ID"] = MODAL_TOKEN_ID
-        os.environ["MODAL_TOKEN_SECRET"] = MODAL_TOKEN_SECRET
-        MODAL_AVAILABLE = True
-        logger.info("Modal cloud GPU configured — premium FLUX.1-dev available")
-    else:
-        logger.info("No Modal credentials — using local image generation")
-except ImportError:
-    logger.info("Modal not installed — using local image generation")
-
-
-def generate_image_modal(prompt: str) -> bytes:
-    """Generate premium image via Modal cloud GPU (FLUX.1-dev on A10G)."""
-    import modal as _modal
-    # Import the function from the sibling script
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    from flux_modal import generate_high_quality_image
-
-    logger.info(f"Modal FLUX.1-dev: generating on cloud A10G GPU...")
-    img_bytes = generate_high_quality_image.remote(prompt)
-    logger.info(f"Modal image generated: {len(img_bytes)} bytes")
-    return img_bytes
-
 
 # Groq client for script generation
 try:
@@ -374,26 +342,12 @@ def generate_image_from_pollinations(prompt: str, style: str = "cinematic", widt
     import urllib.parse
     from PIL import ImageFilter, ImageEnhance
 
-    # Build Lovable-style enhanced prompt for maximum quality
-    style_hints = {
-        "cinematic": "anamorphic lens flare, shallow depth of field, teal-amber color grade, cinematic lighting",
-        "photorealistic": "shot on 85mm f/1.4, natural skin texture, true-to-life colour, photorealistic",
-        "anime": "hand-painted illustration, bold linework, rich gouache texture, anime style",
-        "3d render": "octane render, subsurface scattering, global illumination, 3D render",
-        "digital art": "detailed digital painting, vibrant colors, concept art quality, digital art",
-        "oil painting": "classical oil painting, rich brushstrokes, gallery quality",
-        "watercolor": "soft watercolor painting, delicate washes, artistic watercolor",
-        "pixel art": "retro pixel art, 16-bit style, nostalgic pixel art",
-    }
-    style_hint = style_hints.get(style, style_hints["cinematic"])
+    # Build the prompt with style and quality keywords
     if enhance:
         cinematic_prompt = (
-            f"{prompt}. "
-            f"{style_hint}. "
-            f"Ultra-high resolution, razor-sharp focus, fine micro-detail. "
-            f"High dynamic range, deep contrast, rich color depth, professional color grading. "
-            f"Masterpiece quality, award-winning photography. "
-            f"Avoid: blurry, low quality, distorted, watermark, text."
+            f"{style} style, {prompt}, "
+            f"highly detailed, sharp focus, dramatic lighting, "
+            f"professional photography, 8k resolution, masterpiece"
         )
     else:
         cinematic_prompt = prompt
@@ -465,136 +419,8 @@ def generate_image_from_pollinations(prompt: str, style: str = "cinematic", widt
     raise HTTPException(status_code=502, detail="All image generation providers failed")
 
 
-def generate_image_gemini(prompt: str, style: str = "cinematic", width: int = 4096, height: int = 2304, enhance: bool = True) -> bytes:
-    """Generate a high-quality image using Google Gemini (free tier). Lovable-quality output."""
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY not configured")
-
-    # Build the Lovable-style enhanced prompt
-    style_hints = {
-        "cinematic": "anamorphic lens flare, shallow depth of field, teal-amber color grade",
-        "photorealistic": "shot on 85mm f/1.4, natural skin texture, true-to-life colour",
-        "anime": "hand-painted illustration, bold linework, rich gouache texture",
-        "3d render": "octane render, subsurface scattering, global illumination",
-        "digital art": "detailed digital painting, vibrant colors, concept art quality",
-        "oil painting": "classical oil painting, rich brushstrokes, gallery quality",
-        "watercolor": "soft watercolor painting, delicate washes, artistic",
-        "pixel art": "retro pixel art, 16-bit style, nostalgic",
-    }
-    style_hint = style_hints.get(style, style_hints["cinematic"])
-    aspect = f"{width}:{height}"
-
-    enhanced_prompt = (
-        f"{prompt}. "
-        f"{style_hint}. "
-        f"Aspect ratio {aspect}. "
-        f"Ultra-high resolution, razor-sharp focus, fine micro-detail. "
-        f"High dynamic range, deep contrast, rich color depth, professional color grading. "
-        f"Masterpiece quality, award-winning photography."
-    )
-
-    import urllib.parse
-    import base64
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/gemini-2.5-flash-image:generateContent?key={GEMINI_API_KEY}"
-    )
-
-    payload = {
-        "contents": [{"parts": [{"text": enhanced_prompt}]}],
-        "generationConfig": {
-            "responseModalities": ["image", "text"],
-            "temperature": 1.0,
-        },
-    }
-
-    for attempt in range(2):
-        try:
-            logger.info(f"Gemini image gen (attempt {attempt+1}/2): {prompt[:80]}...")
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                result = json.loads(resp.read().decode())
-
-            # Extract image from response
-            candidates = result.get("candidates", [])
-            if not candidates:
-                logger.warning("Gemini returned no candidates")
-                time.sleep(3)
-                continue
-
-            parts = candidates[0].get("content", {}).get("parts", [])
-            img_bytes = None
-            for part in parts:
-                if "inlineData" in part:
-                    img_bytes = base64.b64decode(part["inlineData"]["data"])
-                    break
-
-            if not img_bytes or len(img_bytes) < 1000:
-                logger.warning(f"Gemini returned tiny/no image ({len(img_bytes) if img_bytes else 0} bytes)")
-                time.sleep(3)
-                continue
-
-            # Post-process: resize to target + enhance
-            try:
-                pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                orig_w, orig_h = pil_img.size
-                if orig_w < width or orig_h < height:
-                    pil_img = pil_img.resize((width * 2, height * 2), Image.LANCZOS)
-                    pil_img = pil_img.resize((width, height), Image.LANCZOS)
-                enhancer = ImageEnhance.Contrast(pil_img)
-                pil_img = enhancer.enhance(1.10)
-                enhancer = ImageEnhance.Color(pil_img)
-                pil_img = enhancer.enhance(1.05)
-                pil_img = pil_img.filter(
-                    ImageFilter.UnsharpMask(radius=2, percent=120, threshold=2)
-                )
-                buf = io.BytesIO()
-                pil_img.save(buf, format="PNG")
-                img_bytes = buf.getvalue()
-                logger.info(f"Gemini image: {orig_w}x{orig_h} → {width}x{height}, {len(img_bytes)} bytes")
-            except Exception as pe:
-                logger.warning(f"Post-process failed: {pe}")
-
-            return img_bytes
-        except urllib.error.HTTPError as he:
-            body = he.read().decode() if he.fp else str(he)
-            logger.error(f"Gemini HTTP {he.code}: {body[:200]}")
-            if he.code == 429:
-                time.sleep(10)
-            else:
-                time.sleep(3)
-        except Exception as e:
-            logger.error(f"Gemini failed: {str(e)[:150]}")
-            time.sleep(3)
-
-    raise HTTPException(status_code=502, detail="Gemini image generation failed after retries")
-
-
 def generate_image(prompt: str, negative_prompt: str = "", style: str = "cinematic", width: int = 4096, height: int = 2304, enhance: bool = True, nologo: bool = False) -> bytes:
-    """Generate an image: Modal FLUX.1-dev (best) → Gemini → HF FLUX → Pollinations (free)."""
-    # Priority 0: Modal Cloud GPU — FLUX.1-dev on A10G (cinema-grade quality)
-    if MODAL_AVAILABLE:
-        try:
-            logger.info("Trying Modal FLUX.1-dev on cloud A10G GPU...")
-            return generate_image_modal(prompt)
-        except Exception as e:
-            logger.warning(f"Modal failed, falling back: {str(e)[:100]}")
-
-    # Priority 1: Gemini (Lovable-quality)
-    if GEMINI_API_KEY:
-        try:
-            logger.info("Trying Gemini for image generation...")
-            return generate_image_gemini(prompt, style=style, width=width, height=height, enhance=enhance)
-        except Exception as e:
-            logger.warning(f"Gemini failed, falling back: {str(e)[:100]}")
-
-    # Priority 2: HuggingFace FLUX
+    """Generate an image from text using HF FLUX.1-schnell (free tier), with Pollinations fallback."""
     if not hf_client:
         logger.warning("No HF client — using Pollinations fallback")
         return generate_image_from_pollinations(prompt, style=style, width=width, height=height, enhance=enhance, nologo=nologo)
@@ -604,26 +430,8 @@ def generate_image(prompt: str, negative_prompt: str = "", style: str = "cinemat
     for attempt in range(3):
         try:
             logger.info(f"Generating image (attempt {attempt+1}/3) for: {prompt[:80]}...")
-            # Build Lovable-style enhanced prompt for HF FLUX
-            style_hints_hf = {
-                "cinematic": "anamorphic lens flare, shallow depth of field, teal-amber color grade",
-                "photorealistic": "shot on 85mm f/1.4, natural skin texture, true-to-life colour",
-                "anime": "hand-painted illustration, bold linework, rich gouache texture",
-                "3d render": "octane render, subsurface scattering, global illumination",
-                "digital art": "detailed digital painting, vibrant colors, concept art quality",
-                "oil painting": "classical oil painting, rich brushstrokes, gallery quality",
-                "watercolor": "soft watercolor painting, delicate washes",
-                "pixel art": "retro pixel art, 16-bit style",
-            }
-            hint = style_hints_hf.get(style, style_hints_hf["cinematic"])
-            hf_prompt = (
-                f"{prompt}. {hint}. "
-                f"Ultra-high resolution, razor-sharp focus, fine micro-detail. "
-                f"High dynamic range, deep contrast, rich color depth, professional color grading. "
-                f"Masterpiece quality. Avoid: blurry, low quality, distorted."
-            )
             img = hf_client.text_to_image(
-                prompt=hf_prompt,
+                prompt=prompt,
                 model="black-forest-labs/FLUX.1-schnell",
             )
 
@@ -699,9 +507,9 @@ def create_ken_burns_video(
     target_w, target_h = resolution
     img_w, img_h = pil_img.size
     
-    # Scale image to fill target with minimal room for movement
-    # Use 1.1x overscan — keeps the full image visible, no cropping
-    overscan = 1.1
+    # Scale image to fill target with extra room for movement
+    # Use 1.4x overscan so we have room to pan/zoom
+    overscan = 1.4
     scale = max(target_w / img_w, target_h / img_h) * overscan
     new_w = int(img_w * scale)
     new_h = int(img_h * scale)
@@ -722,8 +530,8 @@ def create_ken_burns_video(
         clip = ImageClip(temp_img.name, duration=duration)
         
         # --- Cinematic camera movements ---
-        max_zoom = 1.08  # Subtle zoom — keeps full image visible
-        pan_amount = 0.06  # Gentle pan — no cropping
+        max_zoom = 1.25  # Maximum zoom factor
+        pan_amount = 0.15  # How much to pan (fraction of frame)
         
         if effect == "zoom-in":
             # Smooth zoom in with slight upward drift
@@ -782,16 +590,41 @@ def create_ken_burns_video(
             
         else:
             # Default: gentle zoom in
-            clip = clip.with_effects([vfx.Resize(lambda t: 1 + 0.08 * _ease_in_out(t / duration))])
+            clip = clip.with_effects([vfx.Resize(lambda t: 1 + 0.15 * _ease_in_out(t / duration))])
 
         # --- Cinematic overlays ---
         
-        # 1. Fade in/out (0.3s each — subtle)
-        fade_time = min(0.3, duration * 0.1)
+        # 1. Fade in/out (0.5s each)
+        fade_time = min(0.5, duration * 0.15)
         clip = clip.with_effects([vfx.FadeIn(fade_time), vfx.FadeOut(fade_time)])
         
-        # 2. No letterbox bars — full clean image display
-        final = clip
+        # 2. Cinematic letterbox bars (wider than before)
+        bar_h = int(target_h * 0.08)
+        top_bar = ColorClip((target_w, bar_h), color=(0, 0, 0), duration=duration)
+        bottom_bar = ColorClip((target_w, bar_h), color=(0, 0, 0), duration=duration)
+        top_bar = top_bar.with_position((0, 0))
+        bottom_bar = bottom_bar.with_position((0, target_h - bar_h))
+        
+        # 3. Vignette overlay (dark edges for cinematic look)
+        vignette = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+        vignette_draw = ImageDraw.Draw(vignette)
+        for i in range(60):
+            alpha = int(80 * (i / 60) ** 2)
+            margin = i * 3
+            vignette_draw.rectangle(
+                [margin, margin, target_w - margin, target_h - margin],
+                outline=(0, 0, 0, alpha)
+            )
+        vignette_temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        vignette.save(vignette_temp.name, "PNG")
+        vignette_temp.close()
+        vignette_clip = ImageClip(vignette_temp.name, duration=duration).with_duration(duration)
+        
+        # Compose final video
+        final = CompositeVideoClip(
+            [clip, top_bar, bottom_bar, vignette_clip],
+            size=(target_w, target_h)
+        )
 
         final.write_videofile(
             output_path, fps=fps, codec="libx264", audio=False,
@@ -878,7 +711,6 @@ def root():
         "status": "ok",
         "hf_configured": bool(HF_TOKEN),
         "magic_hour_configured": bool(MAGIC_HOUR_API_KEY),
-        "modal_configured": MODAL_AVAILABLE,
         "moviepy_available": MOVIEPY_AVAILABLE,
         "models": list(MODELS.keys()),
     }
@@ -896,8 +728,6 @@ def api_status():
         "hf_configured": bool(HF_TOKEN),
         "magic_hour_configured": bool(MAGIC_HOUR_API_KEY),
         "groq_configured": bool(GROQ_API_KEY),
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "modal_configured": MODAL_AVAILABLE,
         "moviepy_available": MOVIEPY_AVAILABLE,
         "ffmpeg_path": FFMPEG_PATH,
         "models": list(MODELS.keys()),
@@ -1286,115 +1116,6 @@ async def get_video_status(job_id: str):
             "job_id": job_id,
             "message": "Status check failed — will retry on next poll.",
         }
-
-
-# =============================================================================
-# MODAL CLOUD GPU — PREMIUM FLUX.1-DEV IMAGE GENERATION
-# =============================================================================
-@app.post("/api/modal-generate")
-def api_modal_generate(body: dict):
-    """Generate premium image via Modal cloud GPU (FLUX.1-dev on A10G)."""
-    prompt = body.get("prompt", "")
-    if not prompt:
-        raise HTTPException(400, "prompt is required")
-
-    if not MODAL_AVAILABLE:
-        raise HTTPException(503, "Modal cloud GPU not configured. Add MODAL_TOKEN_ID and MODAL_TOKEN_SECRET to .env")
-
-    try:
-        import base64
-        img_bytes = generate_image_modal(prompt)
-        b64 = base64.b64encode(img_bytes).decode()
-        return {"image": b64, "provider": "modal-flux-dev", "message": "Premium FLUX.1-dev image via Modal A10G GPU"}
-    except Exception as e:
-        logger.error(f"Modal generation failed: {str(e)[:200]}")
-        raise HTTPException(502, f"Modal generation failed: {str(e)[:200]}")
-
-
-# =============================================================================
-# IMAGE GENERATION — Gemini → Modal → Pollinations (free fallback)
-# =============================================================================
-@app.post("/api/generate-hf-image")
-def generate_hf_image(body: dict):
-    """Generate image: Gemini (best) → Modal FLUX → Pollinations (free)."""
-    prompt = body.get("prompt", "")
-    if not prompt:
-        raise HTTPException(400, "prompt is required")
-
-    import base64
-
-    # Priority 1: Google Gemini — skip if quota exhausted (fast fail)
-    if GEMINI_API_KEY:
-        try:
-            logger.info(f"Gemini image gen: {prompt[:80]}...")
-            img_bytes = generate_image_gemini(prompt)
-            b64 = base64.b64encode(img_bytes).decode()
-            logger.info(f"Gemini image: {len(img_bytes)} bytes")
-            return {"image": b64, "provider": "gemini", "message": "Premium image generated via Google Gemini"}
-        except Exception as e:
-            err_msg = str(e)[:100]
-            if '429' in err_msg or 'quota' in err_msg.lower():
-                logger.warning(f"Gemini quota exhausted — skipping to Pollinations")
-                # Don't try Gemini again for a while
-            else:
-                logger.warning(f"Gemini failed: {err_msg}")
-
-    # Priority 2: Modal Cloud GPU (FLUX.1-dev on A10G)
-    if MODAL_AVAILABLE:
-        try:
-            logger.info(f"Modal FLUX.1-dev: {prompt[:80]}...")
-            img_bytes = generate_image_modal(prompt)
-            b64 = base64.b64encode(img_bytes).decode()
-            return {"image": b64, "provider": "modal-flux-dev", "message": "Premium image via Modal A10G GPU"}
-        except Exception as e:
-            logger.warning(f"Modal failed, falling back: {str(e)[:100]}")
-
-    # Priority 3: Pollinations.ai FLUX (free, no key)
-    import urllib.parse
-    encoded = urllib.parse.quote(prompt)
-    seed = int(time.time() * 1000) % 100000
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1920&height=1080&seed={seed}&model=flux&enhance=true"
-    )
-
-    logger.info(f"Pollinations FLUX direct: {prompt[:80]}...")
-
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                img_bytes = resp.read()
-
-            if len(img_bytes) < 1000:
-                logger.warning(f"Pollinations tiny image ({len(img_bytes)} bytes)")
-                time.sleep(3)
-                continue
-
-            # Post-process for quality
-            try:
-                from PIL import ImageFilter, ImageEnhance
-                pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                enhancer = ImageEnhance.Contrast(pil_img)
-                pil_img = enhancer.enhance(1.10)
-                enhancer = ImageEnhance.Color(pil_img)
-                pil_img = enhancer.enhance(1.05)
-                pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=2, percent=120, threshold=2))
-                buf = io.BytesIO()
-                pil_img.save(buf, format="PNG")
-                img_bytes = buf.getvalue()
-            except Exception as pe:
-                logger.warning(f"Post-process skipped: {pe}")
-
-            b64 = base64.b64encode(img_bytes).decode()
-            logger.info(f"Pollinations FLUX image: {len(img_bytes)} bytes")
-            return {"image": b64, "provider": "pollinations", "message": "FLUX image generated via Pollinations"}
-
-        except Exception as e:
-            logger.error(f"Pollinations failed (attempt {attempt+1}/3): {str(e)[:100]}")
-            time.sleep(5)
-
-    raise HTTPException(502, "All image providers failed")
 
 
 # =============================================================================
@@ -1917,20 +1638,6 @@ class PixVerseRequest(BaseModel):
     quality: str = "540p"
 
 
-class KlingRequest(BaseModel):
-    """Request for Kling AI video generation (image-to-video)."""
-    image_url: str = ""
-    prompt: str = "Cinematic camera panning, realistic movement, 4k resolution"
-    duration: int = 5
-    model: str = "kling-v1-5"
-
-
-class KlingImageRequest(BaseModel):
-    """Request for Kling AI image generation (text-to-image)."""
-    prompt: str
-    model: str = "kling-v1"
-
-
 class Json2VideoRequest(BaseModel):
     prompt: str
     duration: int = 5
@@ -1938,129 +1645,6 @@ class Json2VideoRequest(BaseModel):
     height: int = 1080
     fps: int = 25
     quality: str = "high"
-
-
-KLING_API_KEY = os.getenv("KLING_API_KEY", "")
-KLING_BASE_URL = "https://api-singapore.klingai.com"
-
-
-def _kling_headers():
-    return {
-        "Authorization": f"Bearer {KLING_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-@app.post("/api/generate-kling-image")
-async def generate_kling_image(body: KlingImageRequest):
-    """Generate an image using Kling AI image generation."""
-    if not KLING_API_KEY:
-        raise HTTPException(500, "KLING_API_KEY not configured")
-    
-    payload = {
-        "model": body.model or "kling-v1",
-        "prompt": body.prompt,
-        "n": 1,
-        "image_fidelity": 0.5,
-    }
-    
-    try:
-        response = await asyncio.to_thread(
-            http_requests.post,
-            f"{KLING_BASE_URL}/v1/images/generations",
-            json=payload,
-            headers=_kling_headers(),
-            timeout=15,
-        )
-        data = response.json()
-        logger.info(f"Kling image response: {str(data)[:200]}")
-        
-        if response.status_code == 200 and data.get("data"):
-            img_url = data["data"][0].get("url") or data["data"][0].get("b64_json")
-            if img_url:
-                record_call("kling-image", "ok")
-                return {"status": "ok", "image_url": img_url, "provider": "kling-ai"}
-        
-        raise HTTPException(502, f"Kling image failed: {data}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        record_call("kling-image", "error")
-        raise HTTPException(502, f"Kling image error: {str(e)[:200]}")
-
-
-@app.post("/api/generate-kling")
-async def generate_kling_video(body: KlingRequest):
-    """Generate REAL AI video using Kling AI (image-to-video).
-    Quick check: if Kling is down, return immediately so frontend falls back to Ken Burns.
-    """
-    if not KLING_API_KEY:
-        raise HTTPException(500, "KLING_API_KEY not configured")
-    
-    payload = {
-        "model": body.model or "kling-v1-5",
-        "image_url": body.image_url,
-        "prompt": body.prompt or "cinematic camera movement, smooth animation",
-        "duration": body.duration,
-    }
-    
-    try:
-        # Submit video generation task (10s timeout — don't block the frontend)
-        response = await asyncio.to_thread(
-            http_requests.post,
-            f"{KLING_BASE_URL}/v1/videos/image2video",
-            json=payload,
-            headers=_kling_headers(),
-            timeout=15,
-        )
-        data = response.json()
-        logger.info(f"Kling submit response: {str(data)[:300]}")
-        
-        # Kling wraps task_id in data.task_id
-        task_id = data.get("data", {}).get("task_id") or data.get("task_id")
-        if response.status_code != 200 or not task_id:
-            raise HTTPException(502, f"Kling submit failed: {str(data)[:300]}")
-        
-        logger.info(f"Kling task submitted: {task_id}")
-        
-        # Poll until complete (max 2 minutes)
-        for _ in range(8):
-            await asyncio.sleep(15)
-            
-            status_resp = await asyncio.to_thread(
-                http_requests.get,
-                f"{KLING_BASE_URL}/v1/videos/image2video/{task_id}",
-                headers=_kling_headers(),
-                timeout=15,
-            )
-            status_data = status_resp.json()
-            # Kling wraps in data object
-            task_info = status_data.get("data", status_data)
-            status = task_info.get("status")
-            
-            if status == "succeed":
-                videos = task_info.get("task_result", {}).get("videos", [])
-                video_url = videos[0].get("url") if videos else None
-                if video_url:
-                    record_call("kling", "ok")
-                    return {
-                        "status": "ok",
-                        "video_url": video_url,
-                        "task_id": task_id,
-                        "provider": "kling-ai",
-                    }
-            elif status == "failed":
-                record_call("kling", "error")
-                raise HTTPException(502, f"Kling generation failed: {task_info}")
-        
-        record_call("kling", "timeout")
-        raise HTTPException(504, "Kling generation timed out (2 min limit)")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        record_call("kling", "error")
-        raise HTTPException(500, f"Kling API error: {str(e)[:200]}")
 
 
 @app.post("/api/generate-json2video")

@@ -1,0 +1,41 @@
+{
+  "name": "aeo-creations",
+  "productName": "aeo.creations",
+  "version": "1.0.0",
+  "description": "AI Video Creation Studio — Generate scripts, images, and videos with AI",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder",
+    "build-win": "electron-builder --win",
+    "build-portable": "electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.aeo.creations",
+    "productName": "aeo.creations",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "frontend/**/*",
+      "backend/**/*",
+      ".env",
+      "!node_modules/**/*"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "electron/icon.ico"
+    },
+    "portable": {
+      "artifactName": "aeo.creations.exe"
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  }
+}
