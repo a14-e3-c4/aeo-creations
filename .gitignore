@@ -58,3 +58,19 @@ test_*.mp4
 DEPLOY_GUIDE.md
 SETUP_GUIDE.md
 kaggle_notebook.py
+
+# Backend data (user accounts, usage records)
+backend/data/*.json
+backend/data/
+*.json.bak
+
+# Usage tracking
+usage.json
+
+# Session tokens
+aeo_token*
+
+# Output/cache
+output/
+cache/
+uploads/
