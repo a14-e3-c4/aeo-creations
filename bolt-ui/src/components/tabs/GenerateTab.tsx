@@ -51,7 +51,6 @@ export function GenerateTab({
   const [autoAnimate, setAutoAnimate] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Puter.js free AI models (no API key needed!)
   const AI_MODELS = [
     { id: 'google/gemini-3-pro-image-preview', name: 'Gemini 3 Pro', desc: 'Google\'s best — stunning quality', icon: '🌟' },
     { id: 'openai/gpt-image-2', name: 'GPT Image 2', desc: 'OpenAI\'s latest — photorealistic', icon: '🎨' },
@@ -61,10 +60,7 @@ export function GenerateTab({
   ];
 
   useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as string;
-      setPrompt(detail);
-    };
+    const handler = (e: Event) => setPrompt((e as CustomEvent).detail as string);
     window.addEventListener('set-prompt', handler);
     return () => window.removeEventListener('set-prompt', handler);
   }, []);
@@ -79,6 +75,41 @@ export function GenerateTab({
       setHistory(prev => [{ prompt, url: dataUrl }, ...prev].slice(0, 20));
     }
   }, [prompt, setCurrentImageB64]);
+
+  async function animateBase64Image(b64: string, source = 'cinematic-1080p') {
+    setLoading(true);
+    setStatus({ type: 'loading', message: `Creating high-quality ${selectedEffect} animation...` });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+    try {
+      const resp = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: prompt.trim() || 'Cinematic image animation', image_b64: b64, kb_effect: selectedEffect, kb_duration: duration }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      const raw = await resp.text();
+      let data: any = {};
+      try { data = raw ? JSON.parse(raw) : {}; } catch { data = { detail: raw }; }
+      if (!resp.ok || data.error || data.status === 'failed' || data.status === 'error') throw new Error(data.error || data.detail || 'Animation failed on the server.');
+      const vUrl = data.video_url || data.video || data.file;
+      if (!vUrl) throw new Error('The server completed the request but returned no video URL.');
+      showResult(vUrl, b64, 'video');
+      setStatus({ type: 'ok', message: data.message || 'Animation complete \u2014 1080p MP4 ready.' });
+      onRecordUsage('animate', source, 'ok');
+      await onSaveGeneration({ type: 'video', prompt: prompt || 'Image animation', model: source, effect: selectedEffect, duration, media_url: vUrl, thumbnail_url: `data:image/png;base64,${b64}`, status: 'completed' });
+      return vUrl;
+    } catch (e) {
+      const message = e instanceof DOMException && e.name === 'AbortError' ? 'Animation took too long. Please try a shorter duration.' : (e as Error).message;
+      setStatus({ type: 'err', message });
+      onRecordUsage('animate', source, 'error');
+      return null;
+    } finally {
+      clearTimeout(timeout);
+      setLoading(false);
+    }
+  }
 
   async function generate() {
     if (!prompt.trim() && mode === 'text-to-video') {
@@ -155,7 +186,8 @@ export function GenerateTab({
           const canvas = document.createElement('canvas');
           canvas.width = imgElement.naturalWidth || 1024;
           canvas.height = imgElement.naturalHeight || 1024;
-          const ctx = canvas.getContext('2d')!;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error('Could not create image canvas');
           ctx.drawImage(imgElement, 0, 0);
           base64 = canvas.toDataURL('image/png').split(',')[1];
           provider = `puter-${modelName}`;
@@ -195,79 +227,15 @@ export function GenerateTab({
       // Step 3: Auto-animate if enabled, otherwise just show the image
       if (autoAnimate) {
         setStatus({ type: 'loading', message: 'Image generated! Animating to video...' });
-        
-        // Try Kling AI (10s timeout) then Ken Burns fallback
-        let videoUrl = null;
-        try {
-          setStatus({ type: 'loading', message: 'Generating AI video...' });
-          const imageDataUrl = `data:image/png;base64,${base64}`;
-          const controller = new AbortController();
-          const klingTimeout = setTimeout(() => controller.abort(), 10000);
-          const klingResp = await fetch('/api/generate-kling', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              image_url: imageDataUrl,
-              prompt: `Cinematic camera panning, realistic movement, ${selectedStyle} style, 4k resolution`,
-              duration: duration,
-            }),
-            signal: controller.signal,
-          });
-          clearTimeout(klingTimeout);
-          if (klingResp.ok) {
-            const klingData = await klingResp.json();
-            videoUrl = klingData.video_url;
-          }
-        } catch {
-          // Kling failed or timed out, fall back to Ken Burns
-        }
-
-        // Fallback: Ken Burns MP4 video (with 90s timeout)
-        if (!videoUrl) {
-          try {
-            setStatus({ type: 'loading', message: 'Creating Ken Burns video...' });
-            const kbController = new AbortController();
-            const kbTimeout = setTimeout(() => kbController.abort(), 90000);
-            const videoResp = await fetch('/api/generate', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                prompt: prompt.trim(),
-                image_b64: base64,
-                kb_effect: selectedEffect,
-                kb_duration: duration,
-              }),
-              signal: kbController.signal,
-            });
-            clearTimeout(kbTimeout);
-            if (videoResp.ok) {
-              const videoData = await videoResp.json();
-              videoUrl = videoData.video_url || videoData.video;
-            }
-          } catch {
-            // Ken Burns also failed
-          }
-        }
-
+        const videoUrl = await animateBase64Image(base64);
         if (videoUrl) {
-          showResult(videoUrl, base64, 'video');
-          setStatus({ type: 'ok', message: `Generated! ${provider} image + AI video.` });
-          onRecordUsage('generate', provider, 'ok');
-          onSaveGeneration({
-            type: 'video', prompt, model: provider, style: selectedStyle,
-            aspect_ratio: selectedAspect.ratio, resolution: selectedResolution.value,
-            width: selectedResolution.width, height: selectedResolution.height,
-            effect: selectedEffect, duration,
-            media_url: videoUrl, thumbnail_url: `data:image/png;base64,${base64}`,
-            status: 'completed',
-          });
+          setStatus({ type: 'ok', message: `Generated! ${provider} image + cinematic 1080p video.` });
         } else {
           showResult(null, base64, 'image');
           setStatus({ type: 'ok', message: 'Generated! AI image ready. Video generation unavailable.' });
           onRecordUsage('generate', provider, 'ok');
         }
       } else {
-        // No auto-animate — show image with "Animate" button
         showResult(null, base64, 'image');
         setStatus({ type: 'ok', message: `Generated! ${provider} image ready. Click \u25b6 Animate to create video.` });
         onRecordUsage('generate', provider, 'ok');
@@ -295,48 +263,44 @@ export function GenerateTab({
       setStatus({ type: 'err', message: 'Upload or select an image first.' });
       return;
     }
+
+    // If we have a preview (base64), use the extracted animation function
+    if (!imageFile && imagePreview) {
+      const b64 = imagePreview.split(',')[1];
+      await animateBase64Image(b64, 'user-upload');
+      return;
+    }
+
     setLoading(true);
-    setStatus({ type: 'loading', message: 'Animating image with Ken Burns effect...' });
-
+    setStatus({ type: 'loading', message: `Animating uploaded image with ${selectedEffect}...` });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
     try {
-      let body: FormData | string;
-      let headers: Record<string, string>;
-
-      if (imageFile) {
-        body = new FormData();
-        body.append('file', imageFile);
-        body.append('effect', selectedEffect);
-        body.append('duration', String(duration));
-        headers = {};
-      } else {
-        const b64 = imagePreview!.split(',')[1];
-        body = JSON.stringify({ image_b64: b64, effect: selectedEffect, duration });
-        headers = { 'Content-Type': 'application/json' };
-      }
-
-      const resp = await fetch('/api/generate', { method: 'POST', headers, body });
-      const data = await resp.json();
-      if (!resp.ok || data.error) {
-        setStatus({ type: 'err', message: data.error || data.detail || 'Animation failed.' });
-        onRecordUsage('animate', 'kenburns', 'error');
-        return;
-      }
-      const vUrl = data.video_url || data.video;
-      if (vUrl) {
-        showResult(vUrl, null, 'video');
-        setStatus({ type: 'ok', message: data.message || 'Animation complete!' });
-        onRecordUsage('animate', 'kenburns', 'ok');
-        onSaveGeneration({
-          type: 'video', prompt: 'Image animation', model: 'kenburns',
-          effect: selectedEffect, duration, media_url: vUrl, status: 'completed',
-        });
-      } else {
-        setStatus({ type: 'err', message: 'No video URL returned.' });
-      }
+      const body = new FormData();
+      body.append('file', imageFile!);
+      body.append('effect', selectedEffect);
+      body.append('duration', String(duration));
+      const resp = await fetch('/api/generate', { method: 'POST', body, signal: controller.signal });
+      clearTimeout(timeout);
+      const raw = await resp.text();
+      let data: any = {};
+      try { data = raw ? JSON.parse(raw) : {}; } catch { data = { detail: raw }; }
+      if (!resp.ok || data.error || data.status === 'failed') throw new Error(data.error || data.detail || 'Animation failed.');
+      const vUrl = data.video_url || data.video || data.file;
+      if (!vUrl) throw new Error('No video URL returned.');
+      showResult(vUrl, null, 'video');
+      setStatus({ type: 'ok', message: data.message || 'Animation complete!' });
+      onRecordUsage('animate', 'user-upload', 'ok');
+      onSaveGeneration({
+        type: 'video', prompt: 'Uploaded image animation', model: 'user-upload',
+        effect: selectedEffect, duration, media_url: vUrl, status: 'completed',
+      });
     } catch (e) {
-      setStatus({ type: 'err', message: `Error: ${(e as Error).message}` });
-      onRecordUsage('animate', 'kenburns', 'error');
+      const message = e instanceof DOMException && e.name === 'AbortError' ? 'Animation took too long. Please try a shorter duration.' : (e as Error).message;
+      setStatus({ type: 'err', message });
+      onRecordUsage('animate', 'user-upload', 'error');
     } finally {
+      clearTimeout(timeout);
       setLoading(false);
     }
   }
