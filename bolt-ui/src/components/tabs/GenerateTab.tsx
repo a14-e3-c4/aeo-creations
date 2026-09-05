@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Image as ImageIcon, Eye, Download, Sparkles, Film, ZoomIn, ZoomOut,
   ArrowLeft, ArrowRight, Move, Box, Camera, Palette, Brush, Droplets, Grid3x3,
-  Upload, Wand2, Settings2,
+  Upload, Wand2, Settings2, Mic, Music2, Smile, UserRound,
 } from 'lucide-react';
 import {
   STYLE_PRESETS, ASPECT_PRESETS, EFFECT_PRESETS, PROMPT_PRESETS, IMAGE_RESOLUTIONS,
@@ -49,6 +49,10 @@ export function GenerateTab({
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState('google/gemini-3-pro-image-preview');
   const [autoAnimate, setAutoAnimate] = useState(true);
+  const [avatarMode, setAvatarMode] = useState<'talking' | 'singing' | 'expression' | 'idle'>('talking');
+  const [avatarAudio, setAvatarAudio] = useState<File | null>(null);
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const avatarAudioRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const AI_MODELS = [
@@ -109,6 +113,39 @@ export function GenerateTab({
       clearTimeout(timeout);
       setLoading(false);
     }
+  }
+
+  async function animateAvatar() {
+    const b64 = imagePreview?.split(',')[1] || resultB64 || currentImageB64;
+    if (!b64) { setStatus({ type: 'err', message: 'Upload or generate a character image first.' }); return; }
+    if (!avatarAudio && avatarMode !== 'expression' && avatarMode !== 'idle') { setStatus({ type: 'err', message: 'Upload a WAV voice/song file for talking or singing.' }); return; }
+    setAvatarBusy(true); setStatus({ type: 'loading', message: `Creating free local ${avatarMode} animation...` });
+    try {
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const imageBlob = new Blob([bytes], { type: 'image/png' });
+      const form = new FormData();
+      form.append('file', imageBlob, 'character.png');
+      if (avatarAudio) form.append('audio', avatarAudio, avatarAudio.name);
+      form.append('mode', avatarMode);
+      form.append('duration', String(duration));
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 180000);
+      const resp = await fetch('/api/animate-avatar', { method: 'POST', body: form, signal: controller.signal });
+      clearTimeout(timeout);
+      const raw = await resp.text();
+      let data: any = {}; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { detail: raw }; }
+      if (!resp.ok) throw new Error(data.detail || 'Avatar animation failed.');
+      const url = data.video_url || data.video || data.file;
+      if (!url) throw new Error('Avatar animation completed without a video URL.');
+      showResult(url, null, 'video');
+      setStatus({ type: 'ok', message: data.message || 'Free avatar animation complete.' });
+      onRecordUsage('avatar-animate', `free-${avatarMode}`, 'ok');
+      await onSaveGeneration({ type: 'video', prompt: `${avatarMode} avatar animation`, model: `free-local-${avatarMode}`, duration, media_url: url, status: 'completed' });
+    } catch (e) {
+      const message = e instanceof DOMException && e.name === 'AbortError' ? 'Avatar rendering took too long. Try a shorter clip.' : (e as Error).message;
+      setStatus({ type: 'err', message });
+      onRecordUsage('avatar-animate', `free-${avatarMode}`, 'error');
+    } finally { setAvatarBusy(false); }
   }
 
   async function generate() {
@@ -203,10 +240,23 @@ export function GenerateTab({
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 max-w-[1400px] mx-auto">
       <div className="glass-panel rounded-2xl p-6">
         <div className="flex items-center gap-3 mb-1"><div className="w-8 h-8 rounded-[10px] grid place-items-center bg-cyan-500/15"><ImageIcon size={16} className="text-cyan-400" /></div><h2 className="text-base font-bold tracking-tight">Image & Video Generator</h2></div>
-        <p className="text-xs text-gray-500 mb-5 leading-relaxed">Generate ultra-high-resolution cinematic images with AI and animate them into smooth MP4 videos with cinematic camera effects.</p>
+        <p className="text-xs text-gray-500 mb-5 leading-relaxed">Generate ultra-high-resolution cinematic images with AI, animate them into smooth MP4 videos, or make a character talk and sing with the free local avatar engine.</p>
         <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Mode</label>
         <div className="flex gap-2 mb-4"><button onClick={() => setMode('text-to-video')} className={`flex-1 px-4 py-2.5 rounded-[10px] text-xs font-semibold transition-all border ${mode === 'text-to-video' ? 'bg-cyan-500/10 border-cyan-400 text-white' : 'bg-[#0a0a12] border-white/[0.06] text-gray-500 hover:border-white/[0.12]'}`}>Text to Image + Video</button><button onClick={() => setMode('image-to-video')} className={`flex-1 px-4 py-2.5 rounded-[10px] text-xs font-semibold transition-all border ${mode === 'image-to-video' ? 'bg-cyan-500/10 border-cyan-400 text-white' : 'bg-[#0a0a12] border-white/[0.06] text-gray-500 hover:border-white/[0.12]'}`}>Animate My Image</button></div>
         {mode === 'text-to-video' ? <><label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Prompt</label><textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="a cat walking through a neon city at night, cinematic, 4K..." className="input-field min-h-[80px] resize-y leading-relaxed" /><div className="flex flex-wrap gap-1.5 mt-2">{PROMPT_PRESETS.map((p, i) => <button key={i} onClick={() => setPrompt(p)} className="px-2.5 py-1 rounded-full bg-[#0a0a12] border border-white/[0.06] text-[10px] text-gray-500 hover:border-cyan-500/40 hover:text-gray-300 transition-all">{p.length > 33 ? p.slice(0, 31) + '...' : p}</button>)}</div></> : <div className="mb-4"><label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Upload Image to Animate</label><div className="flex gap-2 items-center"><input ref={fileInputRef} type="file" accept="image/*" onChange={e => handleFileSelect(e.target.files?.[0] ?? null)} className="flex-1 text-[11px] text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:bg-surface-3 file:text-gray-300 file:text-xs file:cursor-pointer" /></div>{imagePreview && <div className="mt-2.5"><img src={imagePreview} alt="Preview" className="max-w-full max-h-[200px] rounded-[10px] border-2 border-cyan-400" /><p className="text-[11px] text-gray-500 mt-1">Selected — ready to animate</p></div>}<p className="text-[11px] text-gray-600 bg-[#0a0a12] border-l-2 border-cyan-400 px-3 py-2 rounded-r-md mt-3 leading-relaxed">Upload any image and animate it with cinematic zoom, pan, dolly, and combined camera effects.</p></div>}
+
+        {mode === 'image-to-video' && <div className="mb-4 p-4 rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/[0.04]">
+          <div className="flex items-center gap-2 mb-2"><UserRound size={15} className="text-fuchsia-300" /><span className="text-[11px] font-bold uppercase tracking-wider text-fuchsia-200">Free Character Animation</span><span className="ml-auto text-[9px] font-bold text-emerald-300">NO API CREDITS</span></div>
+          <p className="text-[10px] text-gray-500 mb-3">Turn a portrait into a talking, singing, expressive, or gently animated character locally. Best with one front-facing face.</p>
+          <div className="grid grid-cols-4 gap-1.5 mb-3">
+            {([['talking','🗣️','Talking'],['singing','🎤','Singing'],['expression','😄','Expressions'],['idle','👀','Idle motion']] as const).map(([id, icon, label]) => <button key={id} onClick={() => setAvatarMode(id)} className={`px-2 py-2 rounded-lg border text-[10px] font-semibold ${avatarMode === id ? 'border-fuchsia-400 bg-fuchsia-500/10 text-white' : 'border-white/[0.06] bg-[#0a0a12] text-gray-500'}`}><span className="block text-sm mb-0.5">{icon}</span>{label}</button>)}
+          </div>
+          {(avatarMode === 'talking' || avatarMode === 'singing') && <div className="flex items-center gap-2"><input ref={avatarAudioRef} type="file" accept="audio/wav,audio/x-wav,.wav" onChange={e => setAvatarAudio(e.target.files?.[0] ?? null)} className="flex-1 text-[10px] text-gray-500 file:mr-2 file:py-1.5 file:px-2.5 file:rounded-md file:border-0 file:bg-surface-3 file:text-gray-300 file:text-[10px]" /><Music2 size={15} className="text-fuchsia-300" /></div>}
+          {avatarAudio && <p className="text-[10px] text-gray-500 mt-1">Audio: {avatarAudio.name}</p>}
+          <button onClick={animateAvatar} disabled={avatarBusy || loading} className="w-full mt-3 py-2.5 rounded-lg border border-fuchsia-400/50 bg-fuchsia-500/10 text-fuchsia-100 text-[11px] font-bold flex items-center justify-center gap-2 hover:bg-fuchsia-500/20 disabled:opacity-50">{avatarBusy ? <Spinner /> : avatarMode === 'talking' ? <Mic size={14} /> : avatarMode === 'singing' ? <Music2 size={14} /> : <Smile size={14} />} {avatarBusy ? 'Rendering locally...' : `Animate as ${avatarMode}`}</button>
+          <p className="text-[9px] text-gray-600 mt-2">Talking/singing uses audio-driven mouth and blink motion. No paid animation API is required.</p>
+        </div>}
+
         <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4 flex items-center gap-1">🤖 AI Model <span className="text-[9px] text-green-400 font-normal">FREE</span></label>
         <div className="grid grid-cols-1 gap-1.5">{AI_MODELS.map(m => <button key={m.id} onClick={() => setSelectedModel(m.id)} className={`px-3 py-2 rounded-[8px] text-[11px] font-semibold transition-all border text-left flex items-center gap-2 ${selectedModel === m.id ? 'bg-cyan-500/10 border-cyan-400 text-white' : 'bg-[#0a0a12] border-white/[0.06] text-gray-400 hover:border-white/[0.12]'}`}><span className="text-sm">{m.icon}</span><span>{m.name}</span><span className="text-[9px] text-gray-600 font-normal ml-auto">{m.desc}</span></button>)}</div>
         <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4 flex items-center gap-1"><Settings2 size={11} /> Output Resolution</label>
@@ -217,11 +267,11 @@ export function GenerateTab({
         <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4">Animation Effect</label><div className="grid grid-cols-6 gap-1.5">{EFFECT_PRESETS.map(eff => { const Icon = ICON_MAP[eff.icon] || Move; return <button key={eff.id} onClick={() => setSelectedEffect(eff.id)} className={`effect-item ${selectedEffect === eff.id ? 'active' : ''}`}><Icon size={16} className={selectedEffect === eff.id ? 'text-cyan-400' : ''} />{eff.label}</button>; })}</div>
         <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4">Duration: <span className="text-cyan-400">{duration.toFixed(1)}s</span></label><input type="range" min={2} max={30} step={0.5} value={duration} onChange={e => setDuration(parseFloat(e.target.value))} className="w-full accent-cyan-400 h-1" />
         <div className="flex gap-3 mt-4"><div className="flex-1"><label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Seed (optional)</label><input type="text" value={seed} onChange={e => setSeed(e.target.value)} placeholder="random" className="input-field" /></div><div className="flex-1"><label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Negative Prompt</label><input type="text" value={negPrompt} onChange={e => setNegPrompt(e.target.value)} className="input-field" /></div></div>
-        <button onClick={mode === 'text-to-video' ? generate : animateImage} disabled={loading} className={`btn-primary w-full mt-4 py-3 rounded-[10px] text-[13px] font-bold tracking-wide flex items-center justify-center gap-2 ${mode === 'image-to-video' ? 'btn-rose' : ''}`}>{loading ? <Spinner /> : mode === 'text-to-video' ? <Film size={15} /> : <Wand2 size={15} />}{loading ? 'Generating...' : mode === 'text-to-video' ? 'Generate' : 'Animate This Image'}</button><StatusBadge status={status} />
+        <button onClick={mode === 'text-to-video' ? generate : animateImage} disabled={loading || avatarBusy} className={`btn-primary w-full mt-4 py-3 rounded-[10px] text-[13px] font-bold tracking-wide flex items-center justify-center gap-2 ${mode === 'image-to-video' ? 'btn-rose' : ''}`}>{loading ? <Spinner /> : mode === 'text-to-video' ? <Film size={15} /> : <Wand2 size={15} />}{loading ? 'Generating...' : mode === 'text-to-video' ? 'Generate' : 'Animate This Image'}</button><StatusBadge status={status} />
       </div>
       <div className="glass-panel rounded-2xl p-6">
         <div className="flex items-center gap-3 mb-4"><div className="w-8 h-8 rounded-[10px] grid place-items-center bg-emerald-500/15"><Eye size={16} className="text-emerald-400" /></div><h2 className="text-base font-bold tracking-tight">Preview</h2>{resultType && <span className="ml-auto text-[10px] text-gray-500 uppercase tracking-wider">{resultType === 'video' ? '🎬 Video' : '🖼 Image'}</span>}</div>
-        <div className="bg-black rounded-2xl min-h-[300px] max-h-[500px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">{resultType === 'video' && resultUrl ? <video src={resultUrl} controls autoPlay loop className="max-w-full max-h-[480px] object-contain rounded-lg" /> : resultType === 'image' && resultB64 ? <img src={`data:image/png;base64,${resultB64}`} alt="Generated" className="max-w-full max-h-[480px] object-contain cursor-zoom-in rounded-lg" onClick={() => onLightbox(`data:image/png;base64,${resultB64}`)} /> : <div className="text-center text-gray-600 text-[13px] px-10 py-10 leading-relaxed"><ImageIcon size={40} className="mx-auto mb-3 opacity-40" />Your generated content will appear here<span className="block text-[11px] opacity-60 mt-1">AI image → cinematic animation → MP4</span></div>}{loading && <div className="absolute inset-0 bg-black/50 grid place-items-center"><div className="text-center"><Spinner size={32} /><p className="text-xs text-gray-400 mt-2">Generating...</p></div></div>}</div>
+        <div className="bg-black rounded-2xl min-h-[300px] max-h-[500px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">{resultType === 'video' && resultUrl ? <video src={resultUrl} controls autoPlay loop className="max-w-full max-h-[480px] object-contain rounded-lg" /> : resultType === 'image' && resultB64 ? <img src={`data:image/png;base64,${resultB64}`} alt="Generated" className="max-w-full max-h-[480px] object-contain cursor-zoom-in rounded-lg" onClick={() => onLightbox(`data:image/png;base64,${resultB64}`)} /> : <div className="text-center text-gray-600 text-[13px] px-10 py-10 leading-relaxed"><ImageIcon size={40} className="mx-auto mb-3 opacity-40" />Your generated content will appear here<span className="block text-[11px] opacity-60 mt-1">AI image → cinematic animation → MP4</span></div>}{(loading || avatarBusy) && <div className="absolute inset-0 bg-black/50 grid place-items-center"><div className="text-center"><Spinner size={32} /><p className="text-xs text-gray-400 mt-2">Rendering animation...</p></div></div>}</div>
         <div className="flex gap-2 flex-wrap mt-3">{resultUrl && <a href={resultUrl} download={resultType === 'video' ? 'ai_video.mp4' : 'ai_image.png'} className="btn-primary inline-flex items-center gap-2 px-5 py-2.5 rounded-[10px] text-xs font-semibold"><Download size={14} />Download {resultType === 'video' ? 'MP4' : 'Image'}</a>}{resultB64 && resultType === 'image' && !loading && <button onClick={() => animateBase64Image(resultB64)} className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-cyan-500/20 border border-cyan-500/40 text-xs text-cyan-300 hover:bg-cyan-500/30 hover:text-white transition-all font-semibold">▶ Animate to Video</button>}{resultB64 && <button onClick={() => onUseForEditing(resultB64)} className="flex items-center gap-1.5 px-3 py-2 rounded-md bg-surface-3 border border-white/[0.06] text-xs text-gray-400 hover:border-cyan-500/40 hover:text-white transition-all"><Sparkles size={13} />Use for Editing</button>}</div>
         {history.length > 0 && <div className="mt-6"><div className="text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-2">Recent Generations</div><div className="grid grid-cols-[repeat(auto-fill,minmax(100px,1fr))] gap-2">{history.map((item, i) => <div key={i} className="relative rounded-[10px] overflow-hidden border border-white/[0.06] bg-surface-3 cursor-pointer group hover:border-cyan-400 transition-all" onClick={() => onLightbox(item.url)}><img src={item.url} alt={item.prompt} className="w-full aspect-square object-cover" /><div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-2"><p className="text-[10px] text-white/80 line-clamp-2">{item.prompt}</p></div></div>)}</div></div>}
       </div>
