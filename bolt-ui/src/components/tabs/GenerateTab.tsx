@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Image as ImageIcon, Eye, Download, Sparkles, Film, ZoomIn, ZoomOut,
   ArrowLeft, ArrowRight, Move, Box, Camera, Palette, Brush, Droplets, Grid3x3,
-  Upload, Wand2, Settings2,
+  Upload, Wand2, Settings2, Maximize,
 } from 'lucide-react';
 import {
   STYLE_PRESETS, ASPECT_PRESETS, EFFECT_PRESETS, PROMPT_PRESETS, IMAGE_RESOLUTIONS,
@@ -557,16 +557,40 @@ export function GenerateTab({
             <span className="ml-auto text-[10px] text-gray-500 uppercase tracking-wider">{resultType === 'video' ? '🎬 Video' : '🖼 Image'}</span>
           )}
         </div>
-        <div className="bg-black rounded-2xl min-h-[300px] max-h-[500px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">
+        <div className="bg-black rounded-2xl min-h-[350px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">
           {resultType === 'video' && resultUrl ? (
-            <video src={resultUrl} controls autoPlay loop className="max-w-full max-h-[480px] object-contain rounded-lg" />
+            <div className="w-full">
+              <video src={resultUrl} controls autoPlay loop className="w-full max-h-[500px] object-contain rounded-lg" />
+              {/* Fullscreen button for video */}
+              <button
+                onClick={() => { const v = document.querySelector('video'); if (v?.requestFullscreen) v.requestFullscreen(); }}
+                className="absolute bottom-4 right-4 px-3 py-1.5 rounded-lg bg-black/70 text-white text-[11px] font-bold hover:bg-black/90 transition-all flex items-center gap-1.5 backdrop-blur-sm"
+              >
+                <Maximize size={13} /> Fullscreen
+              </button>
+            </div>
           ) : resultType === 'image' && resultB64 ? (
-            <img
-              src={`data:image/png;base64,${resultB64}`}
-              alt="Generated"
-              className="max-w-full max-h-[480px] object-contain cursor-zoom-in rounded-lg"
-              onClick={() => onLightbox(`data:image/png;base64,${resultB64}`)}
-            />
+            <div className="w-full relative group">
+              <img
+                src={`data:image/png;base64,${resultB64}`}
+                alt="Generated"
+                className="w-full max-h-[500px] object-contain cursor-zoom-in rounded-lg transition-transform hover:scale-[1.01]"
+                onClick={() => onLightbox(`data:image/png;base64,${resultB64}`)}
+              />
+              {/* Fullscreen overlay on hover */}
+              <button
+                onClick={() => onLightbox(`data:image/png;base64,${resultB64}`)}
+                className="absolute inset-0 flex items-center justify-center bg-black/0 group-hover:bg-black/30 transition-all opacity-0 group-hover:opacity-100"
+              >
+                <div className="px-4 py-2.5 rounded-xl bg-black/70 text-white text-sm font-bold flex items-center gap-2 backdrop-blur-sm">
+                  <Maximize size={16} /> View Fullscreen
+                </div>
+              </button>
+              {/* Corner info */}
+              <div className="absolute bottom-3 left-3 bg-black/70 rounded-lg px-2.5 py-1 backdrop-blur-sm">
+                <span className="text-[10px] text-white/70">Click to view fullscreen · Scroll to zoom</span>
+              </div>
+            </div>
           ) : (
             <div className="text-center text-gray-600 text-[13px] px-10 py-10 leading-relaxed">
               <ImageIcon size={40} className="mx-auto mb-3 opacity-40" />

@@ -3,7 +3,7 @@ import {
   User, Sparkles, Download, RefreshCw, Wand2, Dice3,
   ChevronDown, ChevronUp, Shirt, Eye, Palette, Image as ImageIcon,
   Mic, Play, Pause, Volume2, Zap, Video, WandSparkles,
-  Heart, SmilePlus, ScanFace, Skull, Crown, Flame,
+  Heart, SmilePlus, ScanFace, Skull, Crown, Flame, Maximize,
 } from 'lucide-react';
 import { Spinner } from '@/components/Spinner';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -731,16 +731,31 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
           {result && <span className="ml-auto text-[10px] text-gray-500 uppercase tracking-wider">🖼 Avatar</span>}
         </div>
 
-        <div className="bg-black rounded-2xl min-h-[300px] max-h-[500px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">
+        <div className="bg-black rounded-2xl min-h-[350px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">
           {result ? (
-            <div className="relative">
+            <div className="relative w-full group">
               <img
                 src={result}
                 alt="Generated avatar"
-                className={`max-h-[480px] w-full object-contain rounded-lg transition-transform ${
+                className={`w-full max-h-[500px] object-contain rounded-lg cursor-zoom-in transition-transform hover:scale-[1.01] ${
                   isTalking ? 'animate-pulse' : ''
                 }`}
+                onClick={() => {
+                  const lb = document.querySelector('[data-lightbox-src]') as HTMLElement;
+                  if (lb) lb.click();
+                }}
               />
+              {/* Fullscreen overlay */}
+              <button
+                onClick={() => {
+                  const a = document.createElement('a');
+                  a.href = result;
+                  a.click();
+                }}
+                className="absolute bottom-3 right-3 px-3 py-1.5 rounded-lg bg-black/70 text-white text-[11px] font-bold hover:bg-black/90 transition-all flex items-center gap-1.5 backdrop-blur-sm opacity-0 group-hover:opacity-100"
+              >
+                <Maximize size={13} /> Fullscreen
+              </button>
               {/* Talking indicator overlay */}
               {isTalking && (
                 <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/70 rounded-full px-4 py-2">
