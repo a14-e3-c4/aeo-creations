@@ -1,7 +1,9 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import {
   User, Sparkles, Download, RefreshCw, Wand2, Dice3,
   ChevronDown, ChevronUp, Shirt, Eye, Palette, Image as ImageIcon,
+  Mic, Play, Pause, Volume2, Zap, Video, WandSparkles,
+  Heart, SmilePlus, ScanFace, Skull, Crown, Flame,
 } from 'lucide-react';
 import { Spinner } from '@/components/Spinner';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -43,14 +45,14 @@ function diceBearUrl(style: DiceBearStyle, seed: string): string {
 
 // ── AI Avatar Styles ───────────────────────────────────────────────
 const AVATAR_STYLES = [
-  { id: 'photorealistic', label: 'Photoreal', icon: '📷', hint: 'Ultra-realistic portrait' },
-  { id: 'anime', label: 'Anime', icon: '🎨', hint: 'Japanese animation' },
-  { id: 'cartoon', label: 'Cartoon', icon: '✏️', hint: 'Bold outlines, bright colors' },
-  { id: '3d-render', label: '3D Render', icon: '🧊', hint: 'Pixar-style CGI' },
-  { id: 'oil-painting', label: 'Oil Paint', icon: '🖼️', hint: 'Classical brushstrokes' },
-  { id: 'cyberpunk', label: 'Cyberpunk', icon: '🤖', hint: 'Neon, futuristic' },
-  { id: 'fantasy', label: 'Fantasy', icon: '🧙', hint: 'Magical, ethereal' },
-  { id: 'pixel-art', label: 'Pixel Art', icon: '👾', hint: 'Retro 16-bit' },
+  { id: 'photorealistic', label: 'Photoreal', icon: '📷', hint: 'Ultra-realistic portrait, studio lighting, sharp details' },
+  { id: 'anime', label: 'Anime', icon: '🎨', hint: 'Japanese anime style, vibrant eyes, detailed features' },
+  { id: 'cartoon', label: 'Cartoon', icon: '✏️', hint: 'Bold outlines, bright colors, Disney/Pixar style' },
+  { id: '3d-render', label: '3D Render', icon: '🧊', hint: 'Pixar-quality 3D render, soft lighting' },
+  { id: 'oil-painting', label: 'Oil Paint', icon: '🖼️', hint: 'Classical oil painting, Renaissance brushstrokes' },
+  { id: 'cyberpunk', label: 'Cyberpunk', icon: '🤖', hint: 'Neon glow, futuristic, holographic elements' },
+  { id: 'fantasy', label: 'Fantasy', icon: '🧙', hint: 'Magical, ethereal glow, enchanted atmosphere' },
+  { id: 'ghoul', label: 'Ghoul', icon: '💀', hint: 'Dark, supernatural, dramatic lighting' },
 ];
 
 const EXPRESSIONS = [
@@ -59,7 +61,9 @@ const EXPRESSIONS = [
   { id: 'laughing', label: '😂 Laughing' },
   { id: 'thoughtful', label: '🤔 Thoughtful' },
   { id: 'confident', label: '😎 Confident' },
-  { id: 'mysterious', label: ' mysterious' },
+  { id: 'mysterious', label: '🔮 Mysterious' },
+  { id: 'angry', label: '😡 Angry' },
+  { id: 'surprised', label: '😲 Surprised' },
 ];
 
 const GENDERS = [
@@ -74,6 +78,8 @@ const BACKGROUNDS = [
   { id: 'city', label: '🏙️ City' },
   { id: 'space', label: '🌌 Space' },
   { id: 'gradient', label: '🎨 Gradient' },
+  { id: 'dramatic', label: '🎭 Dramatic' },
+  { id: 'neon', label: '💎 Neon' },
 ];
 
 const QUICK_PRESETS = [
@@ -85,6 +91,30 @@ const QUICK_PRESETS = [
   { label: '👑 Royal Portrait', prompt: 'royal king or queen portrait, golden crown, majestic, oil painting style' },
   { label: '🧛 Dark Vampire', prompt: 'dark gothic vampire portrait, red eyes, dramatic lighting' },
   { label: '🧚 Forest Elf', prompt: 'ethereal forest elf, pointed ears, magical glow, nature background' },
+  { label: '🔥 TikTok Star', prompt: 'young content creator, ring light reflection in eyes, confident smile, modern' },
+  { label: '🎮 Gamer', prompt: 'gaming streamer with headset, RGB lighting, neon background' },
+  { label: '🎬 Director', prompt: 'film director portrait, beret, intense gaze, dramatic shadows' },
+  { label: '🎸 Rock Star', prompt: 'rock musician portrait, leather jacket, smoky atmosphere, moody lighting' },
+];
+
+// ── TikTok Voice Presets ──────────────────────────────────────────
+const TIKTOK_VOICES = [
+  { id: 'en-US-GuyNeural', label: 'Guy — Deep & Authoritative', desc: 'Most popular TikTok narrator voice', icon: '🔥' },
+  { id: 'en-US-ChristopherNeural', label: 'Christopher — Rich Deep', desc: 'Movie trailer energy', icon: '🎬' },
+  { id: 'en-US-EricNeural', label: 'Eric — Bold & Commanding', desc: 'Authoritative narrator', icon: '📢' },
+  { id: 'en-GB-RyanNeural', label: 'Ryan — British Deep', desc: 'Sophisticated British accent', icon: '🇬🇧' },
+  { id: 'en-US-DavisNeural', label: 'Davis — Smooth Deep', desc: 'Smooth podcast host', icon: '🎙️' },
+  { id: 'en-AU-WilliamNeural', label: 'William — Australian Deep', desc: 'Aussie narrator', icon: '🦘' },
+];
+
+// ── Talking avatar animation frames (CSS keyframe simulation) ─────
+const LIP_SYNC_FRAMES = [
+  'M 45 70 Q 50 65 55 70',  // closed
+  'M 43 68 Q 50 60 57 68',  // open small
+  'M 41 66 Q 50 55 59 66',  // open medium
+  'M 39 64 Q 50 50 61 64',  // open wide
+  'M 43 68 Q 50 58 57 68',  // open small
+  'M 45 70 Q 50 65 55 70',  // closed
 ];
 
 interface AvatarTabProps {
@@ -93,7 +123,7 @@ interface AvatarTabProps {
 }
 
 export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
-  const [mode, setMode] = useState<'ai' | 'dicebear'>('ai');
+  const [mode, setMode] = useState<'ai' | 'dicebear' | 'talking'>('ai');
 
   // AI mode
   const [prompt, setPrompt] = useState('');
@@ -107,12 +137,28 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
   const [seed, setSeed] = useState('aeo-user');
   const [showAllStyles, setShowAllStyles] = useState(false);
 
+  // Talking avatar mode
+  const [talkText, setTalkText] = useState('');
+  const [talkVoice, setTalkVoice] = useState('en-US-GuyNeural');
+  const [isTalking, setIsTalking] = useState(false);
+  const [talkAudioUrl, setTalkAudioUrl] = useState<string | null>(null);
+  const talkAudioRef = useRef<HTMLAudioElement>(null);
+  const [lipSyncFrame, setLipSyncFrame] = useState(0);
+  const lipSyncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // Shared
   const [status, setStatus] = useState<StatusResponse>({ type: 'idle', message: 'Pick a style and generate — completely free.' });
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [history, setHistory] = useState<{ url: string; label: string }[]>([]);
   const dicebearInputRef = useRef<HTMLInputElement>(null);
+
+  // Cleanup lip sync timer
+  useEffect(() => {
+    return () => {
+      if (lipSyncTimerRef.current) clearInterval(lipSyncTimerRef.current);
+    };
+  }, []);
 
   // ── Build prompt ──────────────────────────────────────────────────
   function buildAvatarPrompt() {
@@ -121,6 +167,8 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
       : background === 'nature' ? 'natural outdoor background'
       : background === 'city' ? 'urban cityscape background'
       : background === 'space' ? 'cosmic space background'
+      : background === 'dramatic' ? 'dramatic dark background with rim lighting'
+      : background === 'neon' ? 'neon lit background, cyberpunk atmosphere'
       : 'smooth gradient background';
 
     return [
@@ -128,37 +176,70 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
       styleHint,
       `${expression} expression`,
       bgHint,
-      'headshot, centered face, high detail, masterpiece',
+      'headshot, centered face, high detail, masterpiece, sharp focus',
       prompt.trim(),
     ].filter(Boolean).join(', ');
   }
 
-  // ── Generate AI Avatar (via backend proxy to fix CORS) ──────────
+  // ── Generate AI Avatar (try server first, fallback to client-side) ──
   async function generateAIAvatar() {
     setLoading(true);
     setResult(null);
     setStatus({ type: 'loading', message: 'Drawing your avatar with AI...' });
     try {
+      // Try backend proxy first (avoids CORS)
       const resp = await fetch('/api/avatar/proxy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: buildAvatarPrompt(), width: 512, height: 512 }),
       });
-      if (!resp.ok) throw new Error(`Avatar generation failed: ${resp.status}`);
-      const data = await resp.json();
-      if (!data.image) throw new Error('No image returned from server');
-      const dataUrl = `data:image/png;base64,${data.image}`;
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.image) {
+          const dataUrl = `data:image/png;base64,${data.image}`;
+          setResult(dataUrl);
+          setHistory(prev => [{ url: dataUrl, label: `AI: ${style}` }, ...prev].slice(0, 12));
+          setStatus({ type: 'ok', message: 'Avatar generated! Download or save it.' });
+          onRecordUsage('avatar', 'pollinations-ai', 'ok');
+          onSaveGeneration({
+            type: 'image', prompt: buildAvatarPrompt(), model: 'pollinations-ai',
+            style, status: 'completed', thumbnail_url: dataUrl,
+          });
+          setLoading(false);
+          return;
+        }
+      }
+    } catch {
+      // Fall through to client-side
+    }
+
+    // Client-side fallback: load image directly from Pollinations
+    try {
+      const url = pollinationsAvatarUrl(buildAvatarPrompt(), 512);
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('Failed to load from Pollinations'));
+        img.src = url;
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth || 512;
+      canvas.height = img.naturalHeight || 512;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+      const dataUrl = canvas.toDataURL('image/png');
       setResult(dataUrl);
       setHistory(prev => [{ url: dataUrl, label: `AI: ${style}` }, ...prev].slice(0, 12));
-      setStatus({ type: 'ok', message: 'Avatar generated! Download or save it.' });
-      onRecordUsage('avatar', 'pollinations-ai', 'ok');
+      setStatus({ type: 'ok', message: 'Avatar generated! (client-side)' });
+      onRecordUsage('avatar', 'pollinations-client', 'ok');
       onSaveGeneration({
-        type: 'image', prompt: buildAvatarPrompt(), model: 'pollinations-ai',
+        type: 'image', prompt: buildAvatarPrompt(), model: 'pollinations-client',
         style, status: 'completed', thumbnail_url: dataUrl,
       });
     } catch (err) {
       setStatus({ type: 'err', message: err instanceof Error ? err.message : 'Avatar generation failed' });
-      onRecordUsage('avatar', 'pollinations-ai', 'error');
+      onRecordUsage('avatar', 'pollinations', 'error');
     } finally {
       setLoading(false);
     }
@@ -200,6 +281,116 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
     }
   }
 
+  // ── Generate Talking Avatar (image + voiceover + lip sync) ───────
+  async function generateTalkingAvatar() {
+    if (!result) {
+      setStatus({ type: 'err', message: 'Generate an avatar first, then make it talk!' });
+      return;
+    }
+    if (!talkText.trim()) {
+      setStatus({ type: 'err', message: 'Enter text for the avatar to say.' });
+      return;
+    }
+
+    setLoading(true);
+    setStatus({ type: 'loading', message: 'Generating voiceover for your avatar...' });
+
+    try {
+      const resp = await fetch('/api/tts/voiceover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: talkText.trim(), voice: talkVoice, rate: '+0%' }),
+      });
+
+      if (!resp.ok) {
+        // Fallback: use Web Speech API
+        setStatus({ type: 'loading', message: 'Using browser TTS as fallback...' });
+        const utterance = new SpeechSynthesisUtterance(talkText.trim());
+        utterance.voice = speechSynthesis.getVoices().find(v => v.name.includes('Guy')) || null;
+        utterance.rate = 0.9;
+
+        // Start lip sync animation
+        startLipSync();
+        setIsTalking(true);
+
+        utterance.onend = () => {
+          stopLipSync();
+          setIsTalking(false);
+          setStatus({ type: 'ok', message: 'Talking avatar complete!' });
+        };
+
+        speechSynthesis.speak(utterance);
+        setLoading(false);
+        onRecordUsage('talking-avatar', 'web-speech', 'ok');
+        return;
+      }
+
+      const data = await resp.json();
+      if (data.audio_url) {
+        setTalkAudioUrl(data.audio_url);
+        setStatus({ type: 'ok', message: 'Voiceover ready! Press play to watch your avatar talk.' });
+        onRecordUsage('talking-avatar', 'edge-tts', 'ok');
+      }
+    } catch {
+      // Fallback to Web Speech API
+      const utterance = new SpeechSynthesisUtterance(talkText.trim());
+      utterance.rate = 0.9;
+      startLipSync();
+      setIsTalking(true);
+      utterance.onend = () => {
+        stopLipSync();
+        setIsTalking(false);
+        setStatus({ type: 'ok', message: 'Talking avatar complete!' });
+      };
+      speechSynthesis.speak(utterance);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── Lip Sync Animation ──────────────────────────────────────────
+  function startLipSync() {
+    if (lipSyncTimerRef.current) clearInterval(lipSyncTimerRef.current);
+    lipSyncTimerRef.current = setInterval(() => {
+      setLipSyncFrame(prev => (prev + 1) % LIP_SYNC_FRAMES.length);
+    }, 150);
+  }
+
+  function stopLipSync() {
+    if (lipSyncTimerRef.current) {
+      clearInterval(lipSyncTimerRef.current);
+      lipSyncTimerRef.current = null;
+    }
+    setLipSyncFrame(0);
+  }
+
+  function toggleTalking() {
+    if (isTalking) {
+      speechSynthesis.cancel();
+      stopLipSync();
+      setIsTalking(false);
+    } else {
+      generateTalkingAvatar();
+    }
+  }
+
+  // ── Play talking avatar audio ───────────────────────────────────
+  async function playTalking() {
+    if (!talkAudioUrl || !talkAudioRef.current) {
+      await generateTalkingAvatar();
+      return;
+    }
+    const audio = talkAudioRef.current;
+    audio.src = talkAudioUrl;
+    startLipSync();
+    setIsTalking(true);
+    audio.onended = () => {
+      stopLipSync();
+      setIsTalking(false);
+    };
+    audio.play();
+  }
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 max-w-[1400px] mx-auto">
       {/* ── Controls Panel ──────────────────────────────────────────── */}
@@ -212,7 +403,7 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
           <span className="ml-auto text-[10px] text-green-400 font-bold bg-green-500/10 px-2 py-0.5 rounded-full border border-green-500/20">FREE</span>
         </div>
         <p className="text-xs text-gray-500 mb-5 leading-relaxed">
-          Generate unique AI avatars using Pollinations AI and DiceBear — no API keys, no signup, completely free.
+          Generate unique AI avatars with Pollinations AI and DiceBear — or make them talk with voiceover lip-sync.
         </p>
 
         {/* Mode Tabs */}
@@ -237,9 +428,19 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
           >
             <Dice3 size={14} /> Stylized
           </button>
+          <button
+            onClick={() => setMode('talking')}
+            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-[10px] text-xs font-semibold transition-all border ${
+              mode === 'talking'
+                ? 'bg-purple-500/10 border-purple-400 text-white'
+                : 'bg-[#0a0a12] border-white/[0.06] text-gray-500 hover:border-white/[0.12]'
+            }`}
+          >
+            <Video size={14} /> Talking
+          </button>
         </div>
 
-        {mode === 'ai' ? (
+        {mode === 'ai' && (
           /* ── AI Generated Mode ──────────────────────────────────────── */
           <div className="space-y-4">
             <div>
@@ -353,7 +554,9 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
               {loading ? 'Generating...' : 'Generate AI Avatar'}
             </button>
           </div>
-        ) : (
+        )}
+
+        {mode === 'dicebear' && (
           /* ── DiceBear Mode ──────────────────────────────────────────── */
           <div className="space-y-4">
             <div>
@@ -421,6 +624,78 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
           </div>
         )}
 
+        {mode === 'talking' && (
+          /* ── Talking Avatar Mode ──────────────────────────────────── */
+          <div className="space-y-4">
+            {!result ? (
+              <div className="text-center py-8 bg-purple-500/5 border border-purple-500/20 rounded-xl">
+                <Video size={32} className="mx-auto mb-2 text-purple-400 opacity-50" />
+                <p className="text-sm text-gray-400">Generate an avatar first</p>
+                <p className="text-[11px] text-gray-600 mt-1">Switch to AI or Stylized mode, generate an avatar, then come back here to make it talk!</p>
+              </div>
+            ) : (
+              <>
+                <div className="p-3 bg-purple-500/5 border border-purple-500/20 rounded-xl flex items-center gap-3">
+                  <img src={result} alt="Avatar" className="w-12 h-12 rounded-lg object-cover" />
+                  <div>
+                    <p className="text-xs font-semibold text-white">Avatar ready</p>
+                    <p className="text-[10px] text-gray-500">Enter text below to make it talk</p>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                    What should the avatar say?
+                  </label>
+                  <textarea
+                    value={talkText}
+                    onChange={e => setTalkText(e.target.value)}
+                    placeholder="Hey everyone! Welcome to my channel. Today we're doing something amazing..."
+                    className="input-field min-h-[100px] resize-y leading-relaxed"
+                  />
+                  <span className="text-[10px] text-gray-600 mt-1 block">{talkText.length} / 5000 characters</span>
+                </div>
+
+                {/* Voice Selection */}
+                <div>
+                  <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                    🎙️ TikTok Voice (Thick Masculine)
+                  </label>
+                  <div className="grid grid-cols-1 gap-1.5">
+                    {TIKTOK_VOICES.map(v => (
+                      <button
+                        key={v.id}
+                        onClick={() => setTalkVoice(v.id)}
+                        className={`flex items-center gap-3 px-3 py-2.5 rounded-[8px] text-[11px] font-semibold transition-all border text-left ${
+                          talkVoice === v.id
+                            ? 'bg-purple-500/10 border-purple-400 text-white'
+                            : 'bg-[#0a0a12] border-white/[0.06] text-gray-400 hover:border-white/[0.12]'
+                        }`}
+                      >
+                        <span className="text-sm">{v.icon}</span>
+                        <div className="flex-1">
+                          <div>{v.label}</div>
+                          <div className="text-[9px] text-gray-600">{v.desc}</div>
+                        </div>
+                        {talkVoice === v.id && <Zap size={12} className="text-purple-400" />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <button
+                  onClick={isTalking ? toggleTalking : playTalking}
+                  disabled={loading || !talkText.trim()}
+                  className="btn-primary w-full py-3 rounded-[10px] text-[13px] font-bold tracking-wide flex items-center justify-center gap-2 disabled:opacity-40"
+                >
+                  {loading ? <Spinner size={16} /> : isTalking ? <Pause size={15} /> : <Play size={15} />}
+                  {loading ? 'Generating...' : isTalking ? 'Stop Talking' : 'Make Avatar Talk'}
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
         {/* Quick Presets (AI mode only) */}
         {mode === 'ai' && (
           <div className="mt-5 pt-4 border-t border-white/[0.06]">
@@ -432,42 +707,7 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
                   onClick={() => {
                     setPrompt(preset.prompt);
                     setMode('ai');
-                    // Auto-generate
-                    setTimeout(() => {
-                      const fullPrompt = [
-                        `${gender} character portrait`,
-                        AVATAR_STYLES.find(s => s.id === style)?.hint ?? '',
-                        `${expression} expression`,
-                        background === 'studio' ? 'studio portrait background' : 'natural background',
-                        'headshot, centered face, high detail, masterpiece',
-                        preset.prompt,
-                      ].filter(Boolean).join(', ');
-
-                      setLoading(true);
-                      setResult(null);
-                      setStatus({ type: 'loading', message: `Generating ${preset.label} avatar...` });
-                      const url = pollinationsAvatarUrl(fullPrompt, 512);
-                      const img = new Image();
-                      img.crossOrigin = 'anonymous';
-                      img.onload = () => {
-                        const canvas = document.createElement('canvas');
-                        canvas.width = img.naturalWidth || 512;
-                        canvas.height = img.naturalHeight || 512;
-                        const ctx = canvas.getContext('2d')!;
-                        ctx.drawImage(img, 0, 0);
-                        const dataUrl = canvas.toDataURL('image/png');
-                        setResult(dataUrl);
-                        setHistory(prev => [{ url: dataUrl, label: preset.label }, ...prev].slice(0, 12));
-                        setLoading(false);
-                        setStatus({ type: 'ok', message: `${preset.label} avatar generated!` });
-                        onRecordUsage('avatar', 'pollinations-ai', 'ok');
-                      };
-                      img.onerror = () => {
-                        setLoading(false);
-                        setStatus({ type: 'err', message: 'Failed to generate preset avatar' });
-                      };
-                      img.src = url;
-                    }, 50);
+                    setTimeout(() => generateAIAvatar(), 50);
                   }}
                   className="px-2.5 py-1 rounded-full bg-[#0a0a12] border border-white/[0.06] text-[10px] text-gray-500 hover:border-purple-500/40 hover:text-gray-300 transition-all"
                 >
@@ -477,6 +717,8 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
             </div>
           </div>
         )}
+
+        <audio ref={talkAudioRef} />
       </div>
 
       {/* ── Preview Panel ────────────────────────────────────────────── */}
@@ -491,17 +733,40 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
 
         <div className="bg-black rounded-2xl min-h-[300px] max-h-[500px] flex items-center justify-center overflow-hidden relative border border-white/[0.06]">
           {result ? (
-            <img
-              src={result}
-              alt="Generated avatar"
-              className="max-h-[480px] w-full object-contain rounded-lg"
-            />
+            <div className="relative">
+              <img
+                src={result}
+                alt="Generated avatar"
+                className={`max-h-[480px] w-full object-contain rounded-lg transition-transform ${
+                  isTalking ? 'animate-pulse' : ''
+                }`}
+              />
+              {/* Talking indicator overlay */}
+              {isTalking && (
+                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/70 rounded-full px-4 py-2">
+                  <div className="flex items-center gap-0.5">
+                    {[...Array(8)].map((_, i) => (
+                      <div
+                        key={i}
+                        className="w-1 bg-purple-400 rounded-full animate-pulse"
+                        style={{
+                          height: `${8 + Math.random() * 16}px`,
+                          animationDelay: `${i * 0.08}s`,
+                          animationDuration: `${0.3 + Math.random() * 0.3}s`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <span className="text-[10px] text-purple-300 font-bold">LIVE</span>
+                </div>
+              )}
+            </div>
           ) : (
             <div className="text-center text-gray-600 text-[13px] px-10 py-10 leading-relaxed">
               <User size={40} className="mx-auto mb-3 opacity-40" />
               Your avatar appears here
               <span className="block text-[11px] opacity-60 mt-1">
-                {mode === 'ai' ? 'AI-generated with Pollinations — free forever' : 'Stylized with DiceBear — free forever'}
+                {mode === 'talking' ? 'Generate an avatar first, then add voice' : 'AI-generated with Pollinations — free forever'}
               </span>
             </div>
           )}
@@ -510,7 +775,7 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
               <div className="text-center">
                 <Spinner size={32} />
                 <p className="text-xs text-gray-400 mt-2">
-                  {mode === 'ai' ? 'Drawing your avatar...' : 'Crafting stylized avatar...'}
+                  {mode === 'talking' ? 'Making your avatar talk...' : mode === 'ai' ? 'Drawing your avatar...' : 'Crafting stylized avatar...'}
                 </p>
               </div>
             </div>
@@ -530,11 +795,19 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
           )}
           {result && (
             <button
-              onClick={() => mode === 'ai' ? generateAIAvatar() : generateDiceBear()}
+              onClick={() => mode === 'ai' ? generateAIAvatar() : mode === 'dicebear' ? generateDiceBear() : generateTalkingAvatar()}
               disabled={loading}
               className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-cyan-500/20 border border-cyan-500/40 text-xs text-cyan-300 hover:bg-cyan-500/30 hover:text-white transition-all font-semibold"
             >
               <RefreshCw size={13} /> Regenerate
+            </button>
+          )}
+          {result && mode !== 'talking' && (
+            <button
+              onClick={() => setMode('talking')}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-purple-500/20 border border-purple-500/40 text-xs text-purple-300 hover:bg-purple-500/30 hover:text-white transition-all font-semibold"
+            >
+              <Video size={13} /> Make it Talk
             </button>
           )}
         </div>

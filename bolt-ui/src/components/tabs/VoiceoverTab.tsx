@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
-  Mic, Volume2, Download, Loader2, Play, Pause, RotateCcw, Sparkles,
+  Mic, Volume2, Download, Play, Pause, RotateCcw, Sparkles,
+  Zap, Gauge, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { Spinner } from '@/components/Spinner';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -12,45 +13,77 @@ interface Voice {
   label: string;
   gender: string;
   style: string;
+  desc: string;
 }
 
 const DEFAULT_VOICES: Voice[] = [
-  // Thick masculine (TikTok-style)
-  { id: 'en-US-GuyNeural', label: 'Guy — Deep & Authoritative', gender: 'male', style: 'thick' },
-  { id: 'en-US-ChristopherNeural', label: 'Christopher — Rich & Deep', gender: 'male', style: 'thick' },
-  { id: 'en-US-EricNeural', label: 'Eric — Bold & Commanding', gender: 'male', style: 'thick' },
-  { id: 'en-GB-RyanNeural', label: 'Ryan — British Deep', gender: 'male', style: 'thick' },
-  { id: 'en-US-DavisNeural', label: 'Davis — Smooth Deep', gender: 'male', style: 'thick' },
-  { id: 'en-AU-WilliamNeural', label: 'William — Australian Deep', gender: 'male', style: 'thick' },
-  // Masculine
-  { id: 'en-US-AndrewNeural', label: 'Andrew — Warm Male', gender: 'male', style: 'warm' },
-  { id: 'en-US-BrianNeural', label: 'Brian — Friendly Male', gender: 'male', style: 'friendly' },
-  { id: 'en-US-JasonNeural', label: 'Jason — Casual Male', gender: 'male', style: 'casual' },
-  // Feminine
-  { id: 'en-US-JennyNeural', label: 'Jenny — Natural Female', gender: 'female', style: 'natural' },
-  { id: 'en-US-AriaNeural', label: 'Aria — Expressive Female', gender: 'female', style: 'expressive' },
-  { id: 'en-US-SaraNeural', label: 'Sara — Sweet Female', gender: 'female', style: 'sweet' },
-  { id: 'en-GB-SoniaNeural', label: 'Sonia — British Female', gender: 'female', style: 'elegant' },
-  // Neutral
-  { id: 'en-US-AmberNeural', label: 'Amber — Neutral Warm', gender: 'neutral', style: 'warm' },
-  { id: 'en-US-AvaNeural', label: 'Ava — Neutral Soft', gender: 'neutral', style: 'soft' },
+  // ── Thick Masculine (TikTok/Reels power voices) ──
+  { id: 'en-US-GuyNeural', label: 'Guy', gender: 'male', style: 'thick', desc: '🔥 THE TikTok narrator — deep, authoritative' },
+  { id: 'en-US-ChristopherNeural', label: 'Christopher', gender: 'male', style: 'thick', desc: '🎬 Movie trailer energy — rich & booming' },
+  { id: 'en-US-EricNeural', label: 'Eric', gender: 'male', style: 'thick', desc: '📢 Bold & commanding — viral video narrator' },
+  { id: 'en-GB-RyanNeural', label: 'Ryan', gender: 'male', style: 'thick', desc: '🇬🇧 British deep — sophisticated & powerful' },
+  { id: 'en-US-DavisNeural', label: 'Davis', gender: 'male', style: 'thick', desc: '🎙️ Smooth deep — podcast host vibes' },
+  { id: 'en-AU-WilliamNeural', label: 'William', gender: 'male', style: 'thick', desc: '🦘 Australian deep — unique & bold' },
+  { id: 'en-US-BrandonNeural', label: 'Brandon', gender: 'male', style: 'thick', desc: '💪 Strong & assertive — motivational speaker' },
+  { id: 'en-IE-ConnorNeural', label: 'Connor', gender: 'male', style: 'thick', desc: '🍀 Irish deep — warm & captivating' },
+  { id: 'en-IN-PrabhatNeural', label: 'Prabhat', gender: 'male', style: 'thick', desc: '🇮🇳 Indian English — deep & resonant' },
+  { id: 'en-GB-OllieNeural', label: 'Ollie', gender: 'male', style: 'thick', desc: '🎭 British young deep — trendy narrator' },
+
+  // ── Masculine (Warm/Casual) ──
+  { id: 'en-US-AndrewNeural', label: 'Andrew', gender: 'male', style: 'warm', desc: 'Warm & friendly male voice' },
+  { id: 'en-US-BrianNeural', label: 'Brian', gender: 'male', style: 'friendly', desc: 'Friendly conversational male' },
+  { id: 'en-US-JasonNeural', label: 'Jason', gender: 'male', style: 'casual', desc: 'Casual, relaxed male voice' },
+  { id: 'en-US-TonyNeural', label: 'Tony', gender: 'male', style: 'casual', desc: 'Young casual male' },
+  { id: 'en-US-AidenNeural', label: 'Aiden', gender: 'male', style: 'warm', desc: 'Warm young male voice' },
+
+  // ── Feminine ──
+  { id: 'en-US-JennyNeural', label: 'Jenny', gender: 'female', style: 'natural', desc: 'Natural, versatile female voice' },
+  { id: 'en-US-AriaNeural', label: 'Aria', gender: 'female', style: 'expressive', desc: 'Expressive & dynamic female' },
+  { id: 'en-US-SaraNeural', label: 'Sara', gender: 'female', style: 'sweet', desc: 'Sweet & warm female voice' },
+  { id: 'en-GB-SoniaNeural', label: 'Sonia', gender: 'female', style: 'elegant', desc: 'Elegant British female' },
+  { id: 'en-US-AnaNeural', label: 'Ana', gender: 'female', style: 'expressive', desc: 'Young expressive female' },
+  { id: 'en-AU-NatashaNeural', label: 'Natasha', gender: 'female', style: 'natural', desc: 'Australian female' },
+
+  // ── Neutral ──
+  { id: 'en-US-AmberNeural', label: 'Amber', gender: 'neutral', style: 'warm', desc: 'Neutral warm voice' },
+  { id: 'en-US-AvaNeural', label: 'Ava', gender: 'neutral', style: 'soft', desc: 'Soft, gentle voice' },
 ];
 
 const PRESET_SCRIPTS = [
-  { label: '🎬 Movie Trailer', text: 'In a world where everything you know is about to change... one hero rises. This summer, witness the most epic adventure of a lifetime.' },
-  { label: '📱 TikTok Intro', text: 'Hey, listen up! You are NOT going to believe what I just found. This changes everything about how we think about content creation.' },
-  { label: '📢 Ad Voiceover', text: 'Introducing the future of creative tools. Generate stunning images, cinematic videos, and professional scripts — all powered by AI. Start creating today.' },
-  { label: '🎓 Tutorial', text: 'Welcome back to another tutorial. Today we are going to break down exactly how to create professional video content using nothing but AI tools.' },
-  { label: '🔊 Product Review', text: 'Alright, so I have been testing this for about two weeks now and honestly? I am genuinely impressed. Let me show you exactly what makes it special.' },
-  { label: '⚡ Motivational', text: 'Every single day you have a choice. You can stay exactly where you are, or you can take one step forward. Just one step. That is all it takes to start.' },
+  { label: '🎬 Movie Trailer', text: 'In a world where everything you know is about to change... one hero rises. This summer, witness the most epic adventure of a lifetime. Get ready for the ride of your life.' },
+  { label: '📱 TikTok Intro', text: 'Hey, listen up! You are NOT going to believe what I just found. This changes everything about how we think about content creation. Stick around because this is HUGE.' },
+  { label: '📢 Ad Voiceover', text: 'Introducing the future of creative tools. Generate stunning images, cinematic videos, and professional scripts — all powered by AI. Start creating today and watch your content game level up.' },
+  { label: '🎓 Tutorial', text: 'Welcome back to another tutorial. Today we are going to break down exactly how to create professional video content using nothing but AI tools. Follow along step by step.' },
+  { label: '🔊 Product Review', text: 'Alright, so I have been testing this for about two weeks now and honestly? I am genuinely impressed. Let me show you exactly what makes it special and why you need this in your life.' },
+  { label: '⚡ Motivational', text: 'Every single day you have a choice. You can stay exactly where you are, or you can take one step forward. Just one step. That is all it takes to start changing your life forever.' },
+  { label: '😱 Story Time', text: 'Okay so this is the craziest thing that has ever happened to me. I was just walking down the street minding my own business when suddenly... everything changed. Let me explain.' },
+  { label: '🏋️ Fitness', text: 'Stop scrolling and listen. If you want to transform your body in 30 days, you need to hear this. I am going to give you the exact blueprint that changed thousands of lives.' },
+  { label: '💰 Money Talk', text: 'Here is how people are making $10,000 a month from their phone. No experience, no degree, no startup capital. Just this one strategy that nobody is talking about.' },
+  { label: '🌍 Travel', text: 'Pack your bags because we are going somewhere incredible. This destination is going to blow your mind and the best part? It costs less than you think.' },
 ];
 
 const STYLE_FILTERS = [
-  { id: 'all', label: 'All' },
+  { id: 'all', label: 'All Voices' },
   { id: 'thick', label: '🔥 Thick Masculine' },
   { id: 'male', label: '👨 Male' },
   { id: 'female', label: '👩 Female' },
   { id: 'neutral', label: '🧑 Neutral' },
+];
+
+const PITCH_OPTIONS = [
+  { value: '-50%', label: 'Very Low' },
+  { value: '-25%', label: 'Low' },
+  { value: '+0%', label: 'Normal' },
+  { value: '+25%', label: 'High' },
+  { value: '+50%', label: 'Very High' },
+];
+
+const RATE_OPTIONS = [
+  { value: '-30%', label: '0.7x Slow' },
+  { value: '-15%', label: '0.85x' },
+  { value: '+0%', label: '1x Normal' },
+  { value: '+15%', label: '1.15x' },
+  { value: '+30%', label: '1.3x Fast' },
 ];
 
 interface VoiceoverTabProps {
@@ -61,16 +94,20 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
   const [text, setText] = useState('');
   const [voice, setVoice] = useState('en-US-GuyNeural');
   const [rate, setRate] = useState('+0%');
+  const [pitch, setPitch] = useState('+0%');
   const [status, setStatus] = useState<StatusResponse>({ type: 'idle', message: 'Type text and pick a voice to generate a voiceover.' });
   const [loading, setLoading] = useState(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [filter, setFilter] = useState('thick');
+  const [showAllVoices, setShowAllVoices] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
 
   const filteredVoices = DEFAULT_VOICES.filter(v =>
     filter === 'all' ? true : v.style === filter || v.gender === filter
   );
+
+  const visibleVoices = showAllVoices ? filteredVoices : filteredVoices.slice(0, 10);
 
   // ── Generate voiceover ──────────────────────────────────────────
   async function generateVoiceover() {
@@ -80,12 +117,13 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
     }
     setLoading(true);
     setAudioUrl(null);
+    setPlaying(false);
     setStatus({ type: 'loading', message: `Generating voiceover with ${voice}...` });
     try {
       const resp = await fetch('/api/tts/voiceover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: text.trim(), voice, rate }),
+        body: JSON.stringify({ text: text.trim(), voice, rate, pitch }),
       });
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({ detail: 'TTS failed' }));
@@ -124,6 +162,8 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
     return () => audio.removeEventListener('ended', onEnd);
   }, [audioUrl]);
 
+  const selectedVoiceInfo = DEFAULT_VOICES.find(v => v.id === voice);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 max-w-[1400px] mx-auto">
       {/* ── Controls Panel ──────────────────────────────────────────── */}
@@ -136,7 +176,7 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
           <span className="ml-auto text-[10px] text-green-400 font-bold bg-green-500/10 px-2 py-0.5 rounded-full border border-green-500/20">FREE</span>
         </div>
         <p className="text-xs text-gray-500 mb-5 leading-relaxed">
-          Generate TikTok-style voiceovers using Microsoft Edge TTS — free, no API key, natural-sounding AI voices.
+          Generate TikTok-style voiceovers with thick masculine voices — free, no API key, powered by Edge TTS.
         </p>
 
         {/* Text Input */}
@@ -169,7 +209,9 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
         </div>
 
         {/* Voice Filter */}
-        <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4">Voice Type</label>
+        <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4">
+          <Zap size={11} className="inline mr-1" /> Voice Type
+        </label>
         <div className="flex flex-wrap gap-1.5 mb-3">
           {STYLE_FILTERS.map(f => (
             <button
@@ -188,10 +230,10 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
 
         {/* Voice Selection */}
         <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
-          Select Voice
+          Select Voice ({filteredVoices.length} available)
         </label>
-        <div className="grid grid-cols-1 gap-1.5 max-h-[240px] overflow-y-auto pr-1">
-          {filteredVoices.map(v => (
+        <div className="grid grid-cols-1 gap-1.5 max-h-[280px] overflow-y-auto pr-1">
+          {visibleVoices.map(v => (
             <button
               key={v.id}
               onClick={() => setVoice(v.id)}
@@ -202,30 +244,77 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
               }`}
             >
               <Volume2 size={14} className={voice === v.id ? 'text-rose-400' : 'text-gray-600'} />
-              <span className="flex-1">{v.label}</span>
-              {v.style === 'thick' && <span className="text-[9px] text-rose-400 font-bold">TIKTOK</span>}
+              <div className="flex-1 min-w-0">
+                <span className="block">{v.label}</span>
+                <span className="block text-[9px] text-gray-600 truncate">{v.desc}</span>
+              </div>
+              {v.style === 'thick' && <span className="text-[9px] text-rose-400 font-bold shrink-0">🔥 TIKTOK</span>}
             </button>
           ))}
         </div>
+        {filteredVoices.length > 10 && (
+          <button
+            onClick={() => setShowAllVoices(!showAllVoices)}
+            className="mt-2 flex items-center gap-1 text-[10px] text-gray-600 hover:text-gray-400 transition-colors"
+          >
+            {showAllVoices ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+            {showAllVoices ? 'Show less' : `Show all ${filteredVoices.length} voices`}
+          </button>
+        )}
 
-        {/* Speed Control */}
-        <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 mt-4">
-          Speed: <span className="text-rose-400">{rate === '+0%' ? 'Normal' : rate}</span>
-        </label>
-        <div className="flex gap-2">
-          {['-25%', '-10%', '+0%', '+10%', '+25%'].map(r => (
-            <button
-              key={r}
-              onClick={() => setRate(r)}
-              className={`flex-1 px-2 py-1.5 rounded-[6px] text-[10px] font-bold transition-all border ${
-                rate === r
-                  ? 'bg-rose-500/10 border-rose-400 text-white'
-                  : 'bg-[#0a0a12] border-white/[0.06] text-gray-500 hover:border-white/[0.12]'
-              }`}
-            >
-              {r === '+0%' ? '1x' : r}
-            </button>
-          ))}
+        {/* Current Voice Info */}
+        {selectedVoiceInfo && (
+          <div className="mt-3 p-2 bg-rose-500/5 border border-rose-500/15 rounded-lg flex items-center gap-2">
+            <span className="text-sm">🎙️</span>
+            <div>
+              <span className="text-[11px] text-white font-semibold">{selectedVoiceInfo.label}</span>
+              <span className="text-[10px] text-gray-500 ml-2">{selectedVoiceInfo.desc}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Speed + Pitch Controls */}
+        <div className="grid grid-cols-2 gap-4 mt-4">
+          <div>
+            <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-1">
+              <Gauge size={11} /> Speed: <span className="text-rose-400">{rate === '+0%' ? '1x' : rate}</span>
+            </label>
+            <div className="flex gap-1.5">
+              {RATE_OPTIONS.map(r => (
+                <button
+                  key={r.value}
+                  onClick={() => setRate(r.value)}
+                  className={`flex-1 px-1.5 py-1.5 rounded-[6px] text-[10px] font-bold transition-all border ${
+                    rate === r.value
+                      ? 'bg-rose-500/10 border-rose-400 text-white'
+                      : 'bg-[#0a0a12] border-white/[0.06] text-gray-500 hover:border-white/[0.12]'
+                  }`}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
+              Pitch: <span className="text-rose-400">{pitch === '+0%' ? 'Normal' : pitch}</span>
+            </label>
+            <div className="flex gap-1.5">
+              {PITCH_OPTIONS.map(p => (
+                <button
+                  key={p.value}
+                  onClick={() => setPitch(p.value)}
+                  className={`flex-1 px-1.5 py-1.5 rounded-[6px] text-[10px] font-bold transition-all border ${
+                    pitch === p.value
+                      ? 'bg-rose-500/10 border-rose-400 text-white'
+                      : 'bg-[#0a0a12] border-white/[0.06] text-gray-500 hover:border-white/[0.12]'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
 
         {/* Generate Button */}
@@ -259,7 +348,7 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
                 </div>
                 <p className="text-sm font-medium text-white mb-1">Voiceover Ready</p>
                 <p className="text-[10px] text-gray-500">
-                  {DEFAULT_VOICES.find(v => v.id === voice)?.label || voice}
+                  {selectedVoiceInfo?.label || voice} · {selectedVoiceInfo?.desc}
                 </p>
               </div>
               <div className="flex items-center justify-center gap-3">
@@ -272,14 +361,14 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
               </div>
               {playing && (
                 <div className="mt-4 flex items-center justify-center gap-1">
-                  {[...Array(20)].map((_, i) => (
+                  {[...Array(24)].map((_, i) => (
                     <div
                       key={i}
                       className="w-1 bg-rose-400 rounded-full animate-pulse"
                       style={{
-                        height: `${12 + Math.random() * 24}px`,
-                        animationDelay: `${i * 0.05}s`,
-                        animationDuration: `${0.4 + Math.random() * 0.3}s`,
+                        height: `${12 + Math.random() * 28}px`,
+                        animationDelay: `${i * 0.04}s`,
+                        animationDuration: `${0.3 + Math.random() * 0.4}s`,
                       }}
                     />
                   ))}
@@ -330,8 +419,10 @@ export function VoiceoverTab({ onRecordUsage }: VoiceoverTabProps) {
         {/* Info */}
         <div className="mt-6 p-3 bg-[#0a0a12] border-l-2 border-rose-400 rounded-r-md">
           <p className="text-[11px] text-gray-500 leading-relaxed">
-            <strong className="text-rose-400 flex items-center gap-1.5"><Sparkles size={12} /> Free AI Voices</strong>
-            <span className="block mt-1">Powered by Microsoft Edge TTS — completely free, no API key needed. Thick masculine voices like Guy, Christopher, and Eric are great for TikTok and Reels voiceovers.</span>
+            <strong className="text-rose-400 flex items-center gap-1.5"><Sparkles size={12} /> Free TikTok-Style Voices</strong>
+            <span className="block mt-1">
+              Powered by Microsoft Edge TTS — completely free, no API key needed. Thick masculine voices like <strong className="text-white">Guy</strong>, <strong className="text-white">Christopher</strong>, and <strong className="text-white">Eric</strong> are perfect for TikTok Reels, YouTube Shorts, and podcast intros. Adjust speed and pitch for the exact tone you need.
+            </span>
           </p>
         </div>
 
