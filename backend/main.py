@@ -3871,3 +3871,80 @@ async def dicebear_avatar(style: str = "avataaars", seed: str = "aeo-user"):
     except Exception as e:
         record_call("avatar-dicebear", "error")
         raise HTTPException(502, f"DiceBear failed: {str(e)[:100]}")
+
+
+# =============================================================================
+# VIDEO SPLIT — Split a video clip at a specific timestamp
+# =============================================================================
+class SplitVideoRequest(BaseModel):
+    file_path: str
+    split_time: float = Field(..., ge=0)
+    end_time: Optional[float] = Field(default=None)
+
+
+@app.post("/api/split-video")
+async def split_video(body: SplitVideoRequest):
+    """Split a video into two clips at a given timestamp. Returns both clips."""
+    import subprocess
+    if not os.path.exists(body.file_path):
+        raise HTTPException(404, f"File not found: {body.file_path}")
+
+    try:
+        base_name = Path(body.file_path).stem
+        ext = Path(body.file_path).suffix or ".mp4"
+        clip1_name = f"split_{base_name}_part1_{uuid.uuid4().hex[:6]}{ext}"
+        clip2_name = f"split_{base_name}_part2_{uuid.uuid4().hex[:6]}{ext}"
+        clip1_path = str(OUTPUT_DIR / clip1_name)
+        clip2_path = str(OUTPUT_DIR / clip2_name)
+
+        # Split part 1: 0 to split_time
+        cmd1 = [
+            FFMPEG_PATH, "-y", "-i", body.file_path,
+            "-t", str(body.split_time), "-c", "copy", clip1_path
+        ]
+        subprocess.run(cmd1, capture_output=True, timeout=30)
+
+        # Split part 2: split_time to end (or custom end_time)
+        cmd2 = [FFMPEG_PATH, "-y", "-i", body.file_path]
+        cmd2 += ["-ss", str(body.split_time)]
+        if body.end_time is not None:
+            cmd2 += ["-t", str(body.end_time - body.split_time)]
+        cmd2 += ["-c", "copy", clip2_path]
+        subprocess.run(cmd2, capture_output=True, timeout=30)
+
+        record_call("split-video", "ok")
+        return {
+            "status": "ok",
+            "clip1": f"/api/file/{clip1_name}",
+            "clip2": f"/api/file/{clip2_name}",
+            "message": f"Split at {body.split_time}s into two clips",
+        }
+    except Exception as e:
+        record_call("split-video", "error")
+        raise HTTPException(500, f"Split failed: {str(e)[:200]}")
+
+
+# =============================================================================
+# VIDEO CLIP INFO — Get duration and metadata of a video
+# =============================================================================
+@app.get("/api/video-info")
+async def video_info(path: str):
+    """Get video duration and basic metadata."""
+    import subprocess
+    if not os.path.exists(path):
+        raise HTTPException(404, f"File not found: {path}")
+    try:
+        cmd = [FFMPEG_PATH, "-i", path, "-f", "null", "-"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        # Parse duration from stderr
+        duration = 0.0
+        for line in result.stderr.split("\n"):
+            if "Duration:" in line:
+                dur_str = line.split("Duration:")[1].split(",")[0].strip()
+                parts = dur_str.split(":")
+                if len(parts) == 3:
+                    duration = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                break
+        return {"duration": duration, "path": path}
+    except Exception as e:
+        return {"duration": 0, "path": path, "error": str(e)}
