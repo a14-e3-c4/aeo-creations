@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import {
   Clapperboard, Film, Image as ImageIcon, Scissors, Video,
-  Upload, Trash2, Sparkles, X, Wand2,
+  Upload, Trash2, Sparkles, X, Wand2, User,
   LogIn, LogOut, BarChart3, Crown, User as UserIcon,
 } from 'lucide-react';
 import type { Generation, LibraryItem, UsageEntry } from '@/lib/types';
@@ -13,19 +13,21 @@ import { GenerateTab } from '@/components/tabs/GenerateTab';
 import { EditTab } from '@/components/tabs/EditTab';
 import { VideoTab } from '@/components/tabs/VideoTab';
 import { CreateVideoTab } from '@/components/tabs/CreateVideoTab';
+import { AvatarTab } from '@/components/tabs/AvatarTab';
 import { UploadModal } from '@/components/UploadModal';
 import { Lightbox } from '@/components/Lightbox';
 import { AuthModal } from '@/components/AuthModal';
 import { UsageDashboard } from '@/components/UsageDashboard';
 import { PlanSelector } from '@/components/PlanSelector';
 
-export type TabName = 'create' | 'script' | 'aivideo' | 'generate' | 'edit' | 'video';
+export type TabName = 'create' | 'script' | 'aivideo' | 'generate' | 'avatar' | 'edit' | 'video';
 
 const TABS: { id: TabName; label: string; icon: typeof Film }[] = [
   { id: 'create', label: 'Create Video', icon: Wand2 },
   { id: 'script', label: 'Script', icon: Sparkles },
   { id: 'aivideo', label: 'AI Video', icon: Clapperboard },
   { id: 'generate', label: 'Image', icon: ImageIcon },
+  { id: 'avatar', label: 'Avatar', icon: User },
   { id: 'edit', label: 'Edit', icon: Scissors },
   { id: 'video', label: 'Video', icon: Video },
 ];
@@ -261,6 +263,7 @@ function AppInner() {
                 setCurrentImageB64={setCurrentImageB64}
               />
             )}
+            {activeTab === 'avatar' && <AvatarTab onRecordUsage={recordUsage} onSaveGeneration={saveGeneration} />}
             {activeTab === 'edit' && <EditTab currentImageB64={currentImageB64} onRecordUsage={recordUsage} />}
             {activeTab === 'video' && <VideoTab library={library} onRecordUsage={recordUsage} />}
           </div>

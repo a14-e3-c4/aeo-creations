@@ -52,6 +52,15 @@ export const EFFECT_PRESETS: EffectPreset[] = [
   { id: 'pan-right', label: 'Pan Right', icon: 'ArrowRight' },
   { id: 'zoom-pan', label: 'Zoom+Pan', icon: 'Move' },
   { id: 'dolly', label: 'Dolly', icon: 'Film' },
+  { id: 'shake', label: 'Shake', icon: 'Activity' },
+  { id: 'pulse', label: 'Pulse', icon: 'Heart' },
+  { id: 'spin', label: 'Spin', icon: 'RotateCw' },
+  { id: 'bounce', label: 'Bounce', icon: 'ArrowUpDown' },
+  { id: 'glitch', label: 'Glitch', icon: 'Zap' },
+  { id: 'ken-burns-in', label: 'Ken Burns In', icon: 'Maximize' },
+  { id: 'ken-burns-out', label: 'Ken Burns Out', icon: 'Minimize' },
+  { id: 'tilt-shift', label: 'Tilt Shift', icon: 'Focus' },
+  { id: 'parallax', label: 'Parallax', icon: 'Layers' },
 ];
 
 export const AI_MODELS: AIModelOption[] = [
