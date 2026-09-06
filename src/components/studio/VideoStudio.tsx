@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { Clapperboard, Download, ImagePlus, Loader2, Save, Wand2, X } from "lucide-react";
 import { toast } from "sonner";
+import { motion, AnimatePresence } from "framer-motion";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -143,7 +144,11 @@ export function VideoStudio({ onSaved }: { onSaved: () => void }) {
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
+    >
       <div className="panel space-y-5 p-6">
         <div className="space-y-2">
           <div className="flex items-center justify-between">
@@ -213,7 +218,7 @@ export function VideoStudio({ onSaved }: { onSaved: () => void }) {
         </div>
 
         <div className="flex items-center justify-between rounded-xl border border-border bg-background/50 px-4 py-3">
-          <div>
+          <div className="space-y-0.5">
             <p className="text-sm font-medium">Generate soundtrack</p>
             <p className="text-xs text-muted-foreground">Ambient sound, effects and dialogue</p>
           </div>
@@ -223,22 +228,29 @@ export function VideoStudio({ onSaved }: { onSaved: () => void }) {
         <div className="space-y-2">
           <Label>Start frame (optional)</Label>
           <div className="flex flex-wrap items-center gap-2">
-            {startFrame && (
-              <div className="relative">
-                <img
-                  src={startFrame}
-                  alt=""
-                  className="h-16 rounded-lg border border-border object-cover"
-                />
-                <button
-                  onClick={() => setStartFrame(null)}
-                  className="absolute -right-1.5 -top-1.5 grid size-5 place-items-center rounded-full bg-destructive text-destructive-foreground"
-                  aria-label="Remove start frame"
+            <AnimatePresence mode="wait">
+              {startFrame && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.8 }}
+                  className="relative"
                 >
-                  <X className="size-3" />
-                </button>
-              </div>
-            )}
+                  <img
+                    src={startFrame}
+                    alt=""
+                    className="h-16 rounded-lg border border-border object-cover"
+                  />
+                  <button
+                    onClick={() => setStartFrame(null)}
+                    className="absolute -right-1.5 -top-1.5 grid size-5 place-items-center rounded-full bg-destructive text-destructive-foreground"
+                    aria-label="Remove start frame"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
             <Button variant="secondary" size="sm" onClick={() => fileInput.current?.click()}>
               <ImagePlus className="size-4" /> Animate an image
             </Button>
@@ -267,24 +279,47 @@ export function VideoStudio({ onSaved }: { onSaved: () => void }) {
             "relative flex min-h-[380px] flex-1 items-center justify-center overflow-hidden rounded-xl bg-background/60",
           )}
         >
-          {videoUrl ? (
-            <video src={videoUrl} controls playsInline className="max-h-[62vh] w-full" />
-          ) : (
-            <div className="w-full max-w-sm p-8 text-center text-sm text-muted-foreground">
-              {busy ? (
-                <>
-                  <Loader2 className="mx-auto mb-4 size-8 animate-spin opacity-60" />
-                  <Progress value={progress} className="mb-3" />
-                  {statusText}
-                </>
-              ) : (
-                <>
-                  <Clapperboard className="mx-auto mb-3 size-8 opacity-40" />
-                  Your finished clip plays here and is stored safely in your library.
-                </>
-              )}
-            </div>
-          )}
+          <AnimatePresence mode="wait">
+            {videoUrl ? (
+              <motion.div
+                key="video"
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="w-full h-full flex items-center justify-center"
+              >
+                <video src={videoUrl} controls playsInline className="max-h-[62vh] w-full" />
+              </motion.div>
+            ) : (
+              <motion.div
+                key="placeholder"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="w-full max-w-sm p-8 text-center text-sm text-muted-foreground"
+              >
+                {busy ? (
+                  <div className="space-y-4">
+                    <motion.div
+                      animate={{ rotate: 360 }}
+                      transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+                      className="mx-auto flex justify-center"
+                    >
+                      <Loader2 className="size-12 opacity-60" />
+                    </motion.div>
+                    <div className="space-y-2">
+                      <Progress value={progress} className="h-2" />
+                      <p className="font-medium animate-pulse">{statusText}</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <Clapperboard className="mx-auto mb-3 size-8 opacity-40" />
+                    Your finished clip plays here and is stored safely in your library.
+                  </>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button onClick={handleSave} disabled={!storagePath}>
@@ -297,7 +332,7 @@ export function VideoStudio({ onSaved }: { onSaved: () => void }) {
           </Button>
         </div>
       </div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -317,8 +352,10 @@ function ChipRow({
       <Label>{label}</Label>
       <div className="flex flex-wrap gap-2">
         {options.map((o) => (
-          <button
+          <motion.button
             key={o.id}
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
             type="button"
             onClick={() => onChange(o.id)}
             className={cn(
@@ -329,7 +366,7 @@ function ChipRow({
             )}
           >
             {o.label}
-          </button>
+          </motion.button>
         ))}
       </div>
     </div>

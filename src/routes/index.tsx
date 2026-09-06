@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { Clapperboard, ImageIcon, Library, PenLine } from "lucide-react";
+import { Clapperboard, ImageIcon, Library, PenLine, User } from "lucide-react";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StudioHeader } from "@/components/studio/StudioHeader";
 import { ScriptStudio } from "@/components/studio/ScriptStudio";
 import { ImageStudio } from "@/components/studio/ImageStudio";
 import { VideoStudio } from "@/components/studio/VideoStudio";
+import { AvatarStudio } from "@/components/studio/AvatarStudio";
 import { LibraryGrid } from "@/components/studio/LibraryGrid";
 
 export const Route = createFileRoute("/")({
@@ -67,6 +68,7 @@ function Studio() {
           <TabsList className="h-auto w-full flex-wrap justify-start gap-1 rounded-2xl border border-border bg-surface p-1.5">
             <Trigger value="script" icon={<PenLine className="size-4" />} label="Script" />
             <Trigger value="image" icon={<ImageIcon className="size-4" />} label="Image" />
+            <Trigger value="avatar" icon={<User className="size-4" />} label="Avatar" />
             <Trigger value="video" icon={<Clapperboard className="size-4" />} label="Video" />
             <Trigger value="library" icon={<Library className="size-4" />} label="Library" />
           </TabsList>
@@ -76,6 +78,9 @@ function Studio() {
           </TabsContent>
           <TabsContent value="image">
             <ImageStudio onSaved={bump} />
+          </TabsContent>
+          <TabsContent value="avatar">
+            <AvatarStudio onSaved={bump} />
           </TabsContent>
           <TabsContent value="video">
             <VideoStudio onSaved={bump} />
