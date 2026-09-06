@@ -3743,3 +3743,131 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting AI Video Generator on port 8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+
+# =============================================================================
+# AVATAR PROXY — Fixes CORS for Pollinations AI avatar generation
+# =============================================================================
+class AvatarRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, max_length=500)
+    width: int = Field(default=512, ge=128, le=1024)
+    height: int = Field(default=512, ge=128, le=1024)
+
+
+@app.post("/api/avatar/proxy")
+async def avatar_proxy(body: AvatarRequest):
+    """Proxy Pollinations AI avatar generation to fix CORS issues."""
+    import urllib.parse
+    encoded = urllib.parse.quote(body.prompt)
+    seed = int(time.time() * 1000) % 100000
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width={body.width}&height={body.height}&nologo=true&seed={seed}"
+
+    for attempt in range(3):
+        try:
+            logger.info(f"Avatar proxy (attempt {attempt+1}/3): {body.prompt[:60]}...")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                img_bytes = response.read()
+            if len(img_bytes) < 1000:
+                time.sleep(2)
+                continue
+            b64 = base64.b64encode(img_bytes).decode()
+            record_call("avatar-pollinations", "ok")
+            return {"image": b64, "provider": "pollinations", "message": "Avatar generated"}
+        except Exception as e:
+            logger.error(f"Avatar proxy failed (attempt {attempt+1}/3): {str(e)[:100]}")
+            time.sleep(3)
+    raise HTTPException(502, "Avatar generation failed after retries")
+
+
+# =============================================================================
+# TTS VOICEOVER — Free edge-tts with TikTok-style voices
+# =============================================================================
+TTS_VOICES = [
+    # Thick masculine voices (TikTok-style)
+    {"id": "en-US-GuyNeural", "label": "Guy — Deep & Authoritative", "gender": "male", "style": "thick"},
+    {"id": "en-US-ChristopherNeural", "label": "Christopher — Rich & Deep", "gender": "male", "style": "thick"},
+    {"id": "en-US-EricNeural", "label": "Eric — Bold & Commanding", "gender": "male", "style": "thick"},
+    {"id": "en-GB-RyanNeural", "label": "Ryan — British Deep", "gender": "male", "style": "thick"},
+    {"id": "en-US-DavisNeural", "label": "Davis — Smooth Deep", "gender": "male", "style": "thick"},
+    {"id": "en-AU-WilliamNeural", "label": "William — Australian Deep", "gender": "male", "style": "thick"},
+    # Masculine voices
+    {"id": "en-US-AndrewNeural", "label": "Andrew — Warm Male", "gender": "male", "style": "warm"},
+    {"id": "en-US-BrianNeural", "label": "Brian — Friendly Male", "gender": "male", "style": "friendly"},
+    {"id": "en-US-JasonNeural", "label": "Jason — Casual Male", "gender": "male", "style": "casual"},
+    # Feminine voices
+    {"id": "en-US-JennyNeural", "label": "Jenny — Natural Female", "gender": "female", "style": "natural"},
+    {"id": "en-US-AriaNeural", "label": "Aria — Expressive Female", "gender": "female", "style": "expressive"},
+    {"id": "en-US-SaraNeural", "label": "Sara — Sweet Female", "gender": "female", "style": "sweet"},
+    {"id": "en-GB-SoniaNeural", "label": "Sonia — British Female", "gender": "female", "style": "elegant"},
+    # Non-binary / Neutral
+    {"id": "en-US-AmberNeural", "label": "Amber — Neutral Warm", "gender": "neutral", "style": "warm"},
+    {"id": "en-US-AvaNeural", "label": "Ava — Neutral Soft", "gender": "neutral", "style": "soft"},
+]
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+    voice: str = Field(default="en-US-GuyNeural")
+    rate: str = Field(default="+0%")
+    pitch: str = Field(default="+0Hz")
+
+
+@app.get("/api/tts/voices")
+def list_tts_voices():
+    """List available TTS voices."""
+    return {"voices": TTS_VOICES}
+
+
+@app.post("/api/tts/voiceover")
+async def generate_voiceover(body: TTSRequest):
+    """Generate voiceover audio using free edge-tts (no API key)."""
+    if not TTS_AVAILABLE:
+        raise HTTPException(500, "edge-tts not installed. Run: pip install edge-tts")
+
+    # Validate voice
+    valid_ids = [v["id"] for v in TTS_VOICES]
+    if body.voice not in valid_ids:
+        # Try to find a close match
+        body.voice = "en-US-GuyNeural"
+
+    output_name = f"tts_{uuid.uuid4().hex[:8]}.mp3"
+    output_path = OUTPUT_DIR / output_name
+
+    try:
+        logger.info(f"Generating TTS: voice={body.voice}, text={body.text[:60]}...")
+        await _edge_tts_generate(body.text, body.voice, str(output_path))
+        file_size = os.path.getsize(str(output_path))
+        record_call("tts-edge", "ok")
+        return {
+            "status": "ok",
+            "audio_url": f"/api/file/{output_name}",
+            "voice": body.voice,
+            "file_size": file_size,
+            "message": f"Voiceover generated ({file_size} bytes)",
+        }
+    except Exception as e:
+        record_call("tts-edge", "error")
+        raise HTTPException(500, f"TTS generation failed: {str(e)[:200]}")
+
+
+@app.get("/api/avatar/dicebear")
+async def dicebear_avatar(style: str = "avataaars", seed: str = "aeo-user"):
+    """Proxy DiceBear avatar generation."""
+    valid_styles = [
+        "avataaars", "adventurer", "big-ears", "bottts", "fun-emoji",
+        "lorelei", "micah", "notionists", "open-peeps", "personas",
+        "pixel-art", "rings", "shapes", "thumbs",
+    ]
+    if style not in valid_styles:
+        style = "avataaars"
+    url = f"https://api.dicebear.com/9.x/{style}/svg?seed={seed}"
+    try:
+        resp = http_requests.get(url, timeout=10)
+        resp.raise_for_status()
+        svg_text = resp.text
+        record_call("avatar-dicebear", "ok")
+        return {"svg": svg_text, "style": style, "seed": seed}
+    except Exception as e:
+        record_call("avatar-dicebear", "error")
+        raise HTTPException(502, f"DiceBear failed: {str(e)[:100]}")

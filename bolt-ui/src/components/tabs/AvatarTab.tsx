@@ -133,26 +133,21 @@ export function AvatarTab({ onRecordUsage, onSaveGeneration }: AvatarTabProps) {
     ].filter(Boolean).join(', ');
   }
 
-  // ── Generate AI Avatar ───────────────────────────────────────────
+  // ── Generate AI Avatar (via backend proxy to fix CORS) ──────────
   async function generateAIAvatar() {
     setLoading(true);
     setResult(null);
     setStatus({ type: 'loading', message: 'Drawing your avatar with AI...' });
     try {
-      const url = pollinationsAvatarUrl(buildAvatarPrompt(), 512);
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      await new Promise<void>((resolve, reject) => {
-        img.onload = () => resolve();
-        img.onerror = () => reject(new Error('Failed to generate avatar'));
-        img.src = url;
+      const resp = await fetch('/api/avatar/proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: buildAvatarPrompt(), width: 512, height: 512 }),
       });
-      const canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth || 512;
-      canvas.height = img.naturalHeight || 512;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0);
-      const dataUrl = canvas.toDataURL('image/png');
+      if (!resp.ok) throw new Error(`Avatar generation failed: ${resp.status}`);
+      const data = await resp.json();
+      if (!data.image) throw new Error('No image returned from server');
+      const dataUrl = `data:image/png;base64,${data.image}`;
       setResult(dataUrl);
       setHistory(prev => [{ url: dataUrl, label: `AI: ${style}` }, ...prev].slice(0, 12));
       setStatus({ type: 'ok', message: 'Avatar generated! Download or save it.' });

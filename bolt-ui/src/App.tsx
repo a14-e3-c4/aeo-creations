@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import {
-  Clapperboard, Film, Image as ImageIcon, Scissors, Video,
+  Clapperboard, Film, Image as ImageIcon, Scissors, Video, Mic,
   Upload, Trash2, Sparkles, X, Wand2, User,
   LogIn, LogOut, BarChart3, Crown, User as UserIcon,
 } from 'lucide-react';
@@ -14,13 +14,14 @@ import { EditTab } from '@/components/tabs/EditTab';
 import { VideoTab } from '@/components/tabs/VideoTab';
 import { CreateVideoTab } from '@/components/tabs/CreateVideoTab';
 import { AvatarTab } from '@/components/tabs/AvatarTab';
+import { VoiceoverTab } from '@/components/tabs/VoiceoverTab';
 import { UploadModal } from '@/components/UploadModal';
 import { Lightbox } from '@/components/Lightbox';
 import { AuthModal } from '@/components/AuthModal';
 import { UsageDashboard } from '@/components/UsageDashboard';
 import { PlanSelector } from '@/components/PlanSelector';
 
-export type TabName = 'create' | 'script' | 'aivideo' | 'generate' | 'avatar' | 'edit' | 'video';
+export type TabName = 'create' | 'script' | 'aivideo' | 'generate' | 'avatar' | 'voiceover' | 'edit' | 'video';
 
 const TABS: { id: TabName; label: string; icon: typeof Film }[] = [
   { id: 'create', label: 'Create Video', icon: Wand2 },
@@ -28,6 +29,7 @@ const TABS: { id: TabName; label: string; icon: typeof Film }[] = [
   { id: 'aivideo', label: 'AI Video', icon: Clapperboard },
   { id: 'generate', label: 'Image', icon: ImageIcon },
   { id: 'avatar', label: 'Avatar', icon: User },
+  { id: 'voiceover', label: 'Voiceover', icon: Mic },
   { id: 'edit', label: 'Edit', icon: Scissors },
   { id: 'video', label: 'Video', icon: Video },
 ];
@@ -264,6 +266,7 @@ function AppInner() {
               />
             )}
             {activeTab === 'avatar' && <AvatarTab onRecordUsage={recordUsage} onSaveGeneration={saveGeneration} />}
+            {activeTab === 'voiceover' && <VoiceoverTab onRecordUsage={recordUsage} />}
             {activeTab === 'edit' && <EditTab currentImageB64={currentImageB64} onRecordUsage={recordUsage} />}
             {activeTab === 'video' && <VideoTab library={library} onRecordUsage={recordUsage} />}
           </div>
